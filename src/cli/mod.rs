@@ -3,11 +3,20 @@
 mod build;
 mod doc;
 mod fmt_project;
+mod gen;
 mod init;
+#[cfg(feature = "mcp")]
+mod mcp;
+mod output;
 mod plugin;
+mod restart;
 mod serve;
+mod serve_control;
 mod sourcemap;
+mod status;
+mod stop;
 mod syncback;
+mod test;
 mod upload;
 
 use std::{borrow::Cow, env, path::Path, str::FromStr};
@@ -19,11 +28,18 @@ use thiserror::Error;
 pub use self::build::BuildCommand;
 pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
+pub use self::gen::GenCommand;
 pub use self::init::{InitCommand, InitKind};
+#[cfg(feature = "mcp")]
+pub use self::mcp::McpCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
+pub use self::restart::RestartCommand;
 pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
+pub use self::status::StatusCommand;
+pub use self::stop::StopCommand;
 pub use self::syncback::SyncbackCommand;
+pub use self::test::TestCommand;
 pub use self::upload::UploadCommand;
 
 /// Command line options that Rojo accepts, defined using the clap crate.
@@ -43,13 +59,20 @@ impl Options {
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
-            Subcommand::Build(subcommand) => subcommand.run(),
+            Subcommand::Build(subcommand) => subcommand.run(self.global),
             Subcommand::Upload(subcommand) => subcommand.run(),
-            Subcommand::Sourcemap(subcommand) => subcommand.run(),
+            Subcommand::Sourcemap(subcommand) => subcommand.run(self.global),
             Subcommand::FmtProject(subcommand) => subcommand.run(),
             Subcommand::Doc(subcommand) => subcommand.run(),
             Subcommand::Plugin(subcommand) => subcommand.run(),
             Subcommand::Syncback(subcommand) => subcommand.run(self.global),
+            Subcommand::Status(subcommand) => subcommand.run(self.global),
+            Subcommand::Stop(subcommand) => subcommand.run(self.global),
+            Subcommand::Restart(subcommand) => subcommand.run(self.global),
+            Subcommand::Test(subcommand) => subcommand.run(self.global),
+            Subcommand::Gen(subcommand) => subcommand.run(self.global),
+            #[cfg(feature = "mcp")]
+            Subcommand::Mcp(subcommand) => subcommand.run(),
         }
     }
 }
@@ -63,6 +86,24 @@ pub struct GlobalOptions {
     /// Set color behavior. Valid values are auto, always, and never.
     #[clap(long("color"), global(true), default_value("auto"))]
     pub color: ColorChoice,
+
+    /// Emit machine-readable JSON on stdout instead of human-readable text.
+    ///
+    /// When set, progress and diagnostic messages are routed to stderr so that
+    /// stdout contains only the command's JSON result. Useful for scripting and
+    /// AI tooling.
+    #[clap(long, global(true))]
+    pub json: bool,
+}
+
+impl Default for GlobalOptions {
+    fn default() -> Self {
+        GlobalOptions {
+            verbosity: 0,
+            color: ColorChoice::Auto,
+            json: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +165,13 @@ pub enum Subcommand {
     Doc(DocCommand),
     Plugin(PluginCommand),
     Syncback(SyncbackCommand),
+    Status(StatusCommand),
+    Stop(StopCommand),
+    Restart(RestartCommand),
+    Test(TestCommand),
+    Gen(GenCommand),
+    #[cfg(feature = "mcp")]
+    Mcp(McpCommand),
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
@@ -136,4 +184,25 @@ pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
         )?;
         Ok(Cow::Owned(current_dir.join(path)))
     }
+}
+
+/// Resolves the project root directory (where Rojo keeps its `.rojo/` state) for
+/// a project path argument. A path to a `.project.json` file resolves to its
+/// parent directory; a directory resolves to itself. This mirrors how
+/// `rojo serve` derives its root, so `status`/`stop`/`restart` find the same
+/// state file.
+pub(super) fn resolve_project_root(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let path = resolve_path(path)?;
+
+    let dir = if path.is_file() {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+
+    // Canonicalize so the serve-state location matches what `rojo serve` wrote,
+    // regardless of symlinks, `.`/`..`, or trailing slashes.
+    Ok(crate::state_file::canonical_dir(&dir))
 }

@@ -9,11 +9,12 @@ use clap::{CommandFactory, Parser};
 use fs_err::File;
 use memofs::Vfs;
 use roblox_install::RobloxStudio;
+use serde::Serialize;
 use tokio::runtime::Runtime;
 
 use crate::serve_session::ServeSession;
 
-use super::resolve_path;
+use super::{output, resolve_path, GlobalOptions};
 
 const UNKNOWN_OUTPUT_KIND_ERR: &str = "Could not detect what kind of file to build. \
                                        Expected output file to end in .rbxl, .rbxlx, .rbxm, or .rbxmx.";
@@ -44,8 +45,17 @@ pub struct BuildCommand {
     pub watch: bool,
 }
 
+/// Machine-readable result of a `rojo build` invocation, emitted with `--json`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildResult<'a> {
+    project_name: &'a str,
+    output_path: &'a Path,
+    output_kind: &'static str,
+}
+
 impl BuildCommand {
-    pub fn run(self) -> anyhow::Result<()> {
+    pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
         let (output_path, output_kind) = match (self.output, self.plugin) {
             (None, None) => {
                 BuildCommand::command()
@@ -84,7 +94,7 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        write_model(&session, &output_path, output_kind)?;
+        write_model(&session, &output_path, output_kind, &global)?;
 
         if self.watch {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;
@@ -99,7 +109,7 @@ impl BuildCommand {
                 };
                 cursor = new_cursor;
 
-                write_model(&session, &output_path, output_kind)?;
+                write_model(&session, &output_path, output_kind, &global)?;
             }
         }
 
@@ -149,6 +159,15 @@ impl OutputKind {
             _ => None,
         }
     }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            OutputKind::Rbxmx => "rbxmx",
+            OutputKind::Rbxlx => "rbxlx",
+            OutputKind::Rbxm => "rbxm",
+            OutputKind::Rbxl => "rbxl",
+        }
+    }
 }
 
 fn xml_encode_config() -> rbx_xml::EncodeOptions<'static> {
@@ -160,8 +179,11 @@ fn write_model(
     session: &ServeSession,
     output: &Path,
     output_kind: OutputKind,
+    global: &GlobalOptions,
 ) -> anyhow::Result<()> {
-    println!("Building project '{}'", session.project_name());
+    if !global.json {
+        println!("Building project '{}'", session.project_name());
+    }
 
     let tree = session.tree();
     let root_id = tree.get_root_id();
@@ -202,7 +224,17 @@ fn write_model(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("<invalid utf-8>");
-    println!("Built project to {}", filename);
+
+    let result = BuildResult {
+        project_name: session.project_name(),
+        output_path: output,
+        output_kind: output_kind.as_str(),
+    };
+
+    output::emit(global, &result, || {
+        println!("Built project to {}", filename);
+        Ok(())
+    })?;
 
     Ok(())
 }

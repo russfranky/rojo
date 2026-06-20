@@ -3,13 +3,17 @@ use std::{
     io,
     net::IpAddr,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::Sender;
 use memofs::Vfs;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::{
     change_processor::ChangeProcessor,
@@ -85,6 +89,15 @@ pub struct ServeSession {
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
     tree_mutation_sender: Sender<PatchSet>,
+
+    /// The number of clients (e.g. Studio plugins) currently subscribed to this
+    /// session's live message stream. Reported by the `/api/health` endpoint.
+    connected_clients: Arc<AtomicUsize>,
+
+    /// Notified when the session has been asked to shut down gracefully, e.g. via
+    /// the `/api/stop` control endpoint. The web server awaits this to begin a
+    /// graceful shutdown.
+    shutdown: Arc<Notify>,
 }
 
 impl ServeSession {
@@ -95,6 +108,21 @@ impl ServeSession {
     /// currently loaded from the filesystem directly instead of through the
     /// in-memory filesystem layer.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
+        Self::new_with_session_id(vfs, start_path, None)
+    }
+
+    /// Like [`ServeSession::new`], but reuses the given [`SessionId`] when one is
+    /// provided instead of generating a fresh one.
+    ///
+    /// `rojo serve` uses this to keep the same session id across server restarts
+    /// (recorded in the project's serve-state file) so that a connected Studio
+    /// plugin can reconnect seamlessly rather than tearing down on a session-id
+    /// mismatch.
+    pub fn new_with_session_id<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+        session_id: Option<SessionId>,
+    ) -> Result<Self, ServeSessionError> {
         let start_path = start_path.as_ref();
         let start_time = Instant::now();
 
@@ -118,7 +146,7 @@ impl ServeSession {
         log::trace!("Applying initial patch set");
         apply_patch_set(&mut tree, patch_set);
 
-        let session_id = SessionId::new();
+        let session_id = session_id.unwrap_or_else(SessionId::new);
         let message_queue = MessageQueue::new();
 
         let tree = Arc::new(Mutex::new(tree));
@@ -144,6 +172,8 @@ impl ServeSession {
             message_queue,
             tree_mutation_sender,
             vfs,
+            connected_clients: Arc::new(AtomicUsize::new(0)),
+            shutdown: Arc::new(Notify::new()),
         })
     }
 
@@ -195,6 +225,45 @@ impl ServeSession {
         self.start_time
     }
 
+    /// How long this session has been running.
+    pub fn uptime(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    /// The number of clients currently subscribed to the live message stream.
+    pub fn connected_clients(&self) -> usize {
+        self.connected_clients.load(Ordering::SeqCst)
+    }
+
+    /// Returns a guard that counts a connected client for as long as it is held.
+    /// The count is decremented automatically when the guard is dropped, so every
+    /// exit path of a subscription is accounted for.
+    pub fn track_connected_client(&self) -> ConnectedClientGuard {
+        self.connected_clients.fetch_add(1, Ordering::SeqCst);
+        ConnectedClientGuard {
+            counter: Arc::clone(&self.connected_clients),
+        }
+    }
+
+    /// A handle that can be awaited to learn when the session has been asked to
+    /// shut down. Used by the web server to trigger a graceful shutdown.
+    pub fn shutdown_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.shutdown)
+    }
+
+    /// Requests that the session shut down gracefully. Wakes anything awaiting
+    /// the [`shutdown_handle`](Self::shutdown_handle).
+    ///
+    /// Uses `notify_one`, which stores a permit if the server is not yet
+    /// awaiting, so a shutdown request can never be lost to a race.
+    pub fn request_shutdown(&self) {
+        log::debug!(
+            "Graceful shutdown requested for session {}",
+            self.session_id
+        );
+        self.shutdown.notify_one();
+    }
+
     pub fn serve_place_ids(&self) -> Option<&HashSet<u64>> {
         self.root_project.serve_place_ids.as_ref()
     }
@@ -217,6 +286,18 @@ impl ServeSession {
 
     pub fn root_project(&self) -> &Project {
         &self.root_project
+    }
+}
+
+/// Counts one connected client for as long as it is held; decrements the
+/// session's client counter when dropped. See [`ServeSession::track_connected_client`].
+pub struct ConnectedClientGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectedClientGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

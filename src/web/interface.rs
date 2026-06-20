@@ -167,6 +167,36 @@ pub struct ServerInfoResponse {
     pub root_instance_id: Ref,
 }
 
+/// Response body from /api/health and /api/status.
+///
+/// A lightweight liveness/identity probe used by the CLI (`rojo status`/`stop`/
+/// `restart`) and by the Studio plugin to verify, after a dropped connection,
+/// that it is reconnecting to the same logical server.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    pub session_id: SessionId,
+    pub server_version: String,
+    pub protocol_version: u64,
+    pub project_name: String,
+    pub uptime_seconds: u64,
+    pub connected_clients: u64,
+}
+
+/// Request body for /api/stop.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRequest {
+    pub session_id: SessionId,
+}
+
+/// Response body from /api/stop.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopResponse {
+    pub session_id: SessionId,
+}
+
 /// Response body from /api/read/{id}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

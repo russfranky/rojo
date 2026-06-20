@@ -47,6 +47,7 @@ impl LiveServer {
         on_listening: impl FnOnce(),
     ) -> anyhow::Result<()> {
         let serve_session = Arc::clone(&self.serve_session);
+        let shutdown = self.serve_session.shutdown_handle();
         let allowed_hosts = origin::allowed_hosts(address.ip(), address.port(), &allowed_hosts);
 
         let make_service = make_service_fn(move |conn: &AddrStream| {
@@ -92,6 +93,12 @@ impl LiveServer {
                 )
             })?
             .serve(make_service);
+
+        // Stop accepting connections and return from `block_on` once the session
+        // is asked to shut down (e.g. via the `/api/stop` control endpoint).
+        let server = server.with_graceful_shutdown(async move {
+            shutdown.notified().await;
+        });
 
         // Binding succeeded, so it's now safe to tell the user we're listening.
         on_listening();

@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    io::{BufWriter, Write},
+    io::{self, BufWriter, Write},
     mem::forget,
     path::{self, Path, PathBuf},
 };
@@ -19,7 +19,7 @@ use crate::{
     snapshot::{AppliedPatchSet, InstanceWithMeta, RojoTree},
 };
 
-use super::resolve_path;
+use super::{output, resolve_path, GlobalOptions};
 
 const PATH_STRIP_FAILED_ERR: &str = "Failed to create relative paths for project file!";
 const ABSOLUTE_PATH_FAILED_ERR: &str = "Failed to turn relative path into absolute path!";
@@ -70,8 +70,15 @@ pub struct SourcemapCommand {
     pub absolute: bool,
 }
 
+/// Machine-readable result emitted with `--json` when writing to a file.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourcemapFileResult<'a> {
+    output_path: &'a Path,
+}
+
 impl SourcemapCommand {
-    pub fn run(self) -> anyhow::Result<()> {
+    pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
         let project_path = fs_err::canonicalize(resolve_path(&self.project)?)?;
 
         log::trace!("Constructing filesystem with StdBackend");
@@ -97,7 +104,13 @@ impl SourcemapCommand {
             .ok();
 
         log::trace!("Writing initial sourcemap");
-        write_sourcemap(&session, self.output.as_deref(), filter, self.absolute)?;
+        write_sourcemap(
+            &session,
+            self.output.as_deref(),
+            filter,
+            self.absolute,
+            &global,
+        )?;
 
         if self.watch {
             log::trace!("Setting up runtime for watch mode");
@@ -114,7 +127,13 @@ impl SourcemapCommand {
                 cursor = new_cursor;
 
                 if patch_set_affects_sourcemap(&session, &patch_set, filter) {
-                    write_sourcemap(&session, self.output.as_deref(), filter, self.absolute)?;
+                    write_sourcemap(
+                        &session,
+                        self.output.as_deref(),
+                        filter,
+                        self.absolute,
+                        &global,
+                    )?;
                 }
             }
         }
@@ -237,6 +256,7 @@ fn write_sourcemap(
     output: Option<&Path>,
     filter: fn(&InstanceWithMeta) -> bool,
     use_absolute_paths: bool,
+    global: &GlobalOptions,
 ) -> anyhow::Result<()> {
     let tree = session.tree();
 
@@ -253,10 +273,19 @@ fn write_sourcemap(
         serde_json::to_writer(&mut file, &root_node)?;
         file.flush()?;
 
-        println!("Created sourcemap at {}", output_path.display());
+        let result = SourcemapFileResult { output_path };
+        output::emit(global, &result, || {
+            println!("Created sourcemap at {}", output_path.display());
+            Ok(())
+        })?;
     } else {
-        let output = serde_json::to_string(&root_node)?;
-        println!("{}", output);
+        // With no output file, the sourcemap itself is the result and is always
+        // written to stdout as JSON (regardless of --json).
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        serde_json::to_writer(&mut handle, &root_node)?;
+        writeln!(handle)?;
+        handle.flush()?;
     }
 
     Ok(())
@@ -265,7 +294,7 @@ fn write_sourcemap(
 #[cfg(test)]
 mod test {
     use crate::cli::sourcemap::SourcemapNode;
-    use crate::cli::SourcemapCommand;
+    use crate::cli::{GlobalOptions, SourcemapCommand};
     use insta::internals::Content;
     use std::path::Path;
 
@@ -287,7 +316,7 @@ mod test {
             watch: false,
             absolute: false,
         };
-        assert!(sourcemap_command.run().is_ok());
+        assert!(sourcemap_command.run(GlobalOptions::default()).is_ok());
 
         let raw_sourcemap_contents = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
         let sourcemap_contents =
@@ -313,7 +342,7 @@ mod test {
             watch: false,
             absolute: true,
         };
-        assert!(sourcemap_command.run().is_ok());
+        assert!(sourcemap_command.run(GlobalOptions::default()).is_ok());
 
         let raw_sourcemap_contents = fs_err::read_to_string(sourcemap_output.as_path()).unwrap();
         let sourcemap_contents =

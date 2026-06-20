@@ -3,3 +3,6 @@
 /{project_name}.rbxm
 
 sourcemap.json
+
+# Rojo local serve state
+.rojo/

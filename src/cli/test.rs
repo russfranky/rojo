@@ -63,10 +63,19 @@ struct TestResult {
 
 impl TestCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
+        // Resolve the script (and an explicit --place) to absolute paths so they
+        // don't depend on the runner's working directory.
+        let script = self
+            .script
+            .as_deref()
+            .map(resolve_path)
+            .transpose()?
+            .map(|path| path.into_owned());
+
         // Build a place first for runners that consume one.
         let place_path = if self.runner.needs_place() {
             let path = match &self.place {
-                Some(path) => path.clone(),
+                Some(path) => resolve_path(path)?.into_owned(),
                 None => resolve_project_root(&self.project)?
                     .join(".rojo")
                     .join("test-place.rbxl"),
@@ -79,27 +88,26 @@ impl TestCommand {
 
         let mut command =
             self.runner
-                .command(self.script.as_deref(), place_path.as_deref(), &self.args)?;
+                .command(script.as_deref(), place_path.as_deref(), &self.args)?;
         if let Some(place) = &place_path {
             command.env("ROJO_TEST_PLACE", place);
         }
 
         let runner_name = self.runner.as_str().to_owned();
+        let program = command.get_program().to_string_lossy().into_owned();
 
         // A failing test run is an expected outcome rather than an internal
         // error, so we exit with the runner's status code instead of returning
         // an error (which `main` would print with a noisy backtrace).
         if global.json {
-            let out = command
-                .output()
-                .with_context(|| format!("Failed to run the '{runner_name}' test runner"))?;
+            let out = command.output().map_err(|err| spawn_error(&program, err))?;
 
             let result = TestResult {
                 runner: runner_name,
                 success: out.status.success(),
                 exit_code: out.status.code(),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                stdout: cap(String::from_utf8_lossy(&out.stdout).into_owned()),
+                stderr: cap(String::from_utf8_lossy(&out.stderr).into_owned()),
             };
             output::print_json(&result)?;
 
@@ -107,9 +115,7 @@ impl TestCommand {
                 process::exit(out.status.code().unwrap_or(1));
             }
         } else {
-            let status = command
-                .status()
-                .with_context(|| format!("Failed to run the '{runner_name}' test runner"))?;
+            let status = command.status().map_err(|err| spawn_error(&program, err))?;
 
             if !status.success() {
                 eprintln!("Tests failed.");
@@ -121,6 +127,33 @@ impl TestCommand {
 
         Ok(())
     }
+}
+
+/// Maps a runner spawn failure to a helpful error, calling out a missing binary
+/// (the most common failure) specifically.
+fn spawn_error(program: &str, err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("Could not find `{program}` on your PATH. Is it installed?")
+    } else {
+        anyhow::Error::new(err).context(format!("Failed to run `{program}`"))
+    }
+}
+
+/// Caps captured runner output so a chatty runner can't balloon memory or blow
+/// an MCP client's token budget in `--json` mode.
+fn cap(mut output: String) -> String {
+    const MAX: usize = 64 * 1024;
+
+    if output.len() > MAX {
+        let mut end = MAX;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+        output.push_str("\n…[output truncated]");
+    }
+
+    output
 }
 
 /// Builds the project into a place file by invoking `rojo build` on this same

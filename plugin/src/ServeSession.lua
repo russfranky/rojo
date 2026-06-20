@@ -55,21 +55,28 @@ local function attemptReparent(instance, parent)
 	end)
 end
 
+-- A different project served on the same address is fatal for an automatic
+-- reconnect. Defined as a constant so the producer (the reconnect project-name
+-- guard in __attemptConnection) and isFatalError can't drift apart.
+local DIFFERENT_PROJECT_SIGNATURE = "hosts a different project"
+
 -- Errors that mean the server is reachable but fundamentally incompatible or
 -- mismatched, so automatically reconnecting would just loop. Transient errors
--- (the socket dropping, the server being briefly unreachable during a restart)
--- are everything else and are safe to retry.
+-- (the socket dropping, the server briefly unreachable during a restart) are
+-- everything else and are safe to retry. Each signature must match the message
+-- produced where the error is raised.
+local FATAL_ERROR_SIGNATURES = {
+	"protocol version", -- ApiContext.rejectWrongProtocolVersion
+	"specific list of places", -- ApiContext.rejectWrongPlaceId
+	"Cannot sync a model as a place", -- __initialSync
+	"Aborted Rojo sync", -- __initialSync (user chose Abort)
+	DIFFERENT_PROJECT_SIGNATURE, -- __attemptConnection project-name guard
+}
+
 local function isFatalError(err)
 	local message = tostring(err)
-	local fatalSignatures = {
-		"protocol version",
-		"specific list of places",
-		"hosts a different project",
-		"Cannot sync a model as a place",
-		"Aborted Rojo sync",
-	}
 
-	for _, signature in fatalSignatures do
+	for _, signature in FATAL_ERROR_SIGNATURES do
 		if string.find(message, signature, 1, true) ~= nil then
 			return true
 		end
@@ -221,6 +228,12 @@ end
 
 function ServeSession:start()
 	self.__reconnectAttempt = 0
+	-- Defensively cancel any reconnect left pending from a prior life of this
+	-- object, so we can't end up with two concurrent connection attempts.
+	if self.__reconnectThread then
+		task.cancel(self.__reconnectThread)
+		self.__reconnectThread = nil
+	end
 	self:__setStatus(Status.Connecting)
 	self:setLoadingText("Connecting to server...")
 	self:__attemptConnection()
@@ -245,7 +258,8 @@ function ServeSession:__attemptConnection()
 			if self.__projectName ~= nil and serverInfo.projectName ~= self.__projectName then
 				return Promise.reject(
 					string.format(
-						"Server now hosts a different project ('%s', expected '%s'); not reconnecting.",
+						"Server now %s ('%s', expected '%s'); not reconnecting.",
+						DIFFERENT_PROJECT_SIGNATURE,
 						tostring(serverInfo.projectName),
 						tostring(self.__projectName)
 					)
@@ -315,17 +329,21 @@ end
 function ServeSession:__scheduleReconnect(err)
 	self.__reconnectAttempt += 1
 
-	local maxAttempts = Settings:get("instantReconnectMaxAttempts")
+	-- Treat a non-positive limit as "unlimited" explicitly.
+	local maxAttempts = math.max(Settings:get("instantReconnectMaxAttempts"), 0)
 	if maxAttempts > 0 and self.__reconnectAttempt > maxAttempts then
 		Log.warn("Giving up automatic reconnect after {} attempts", maxAttempts)
 		self:__stopInternal(err)
 		return
 	end
 
-	local baseDelay = Settings:get("instantReconnectBaseDelay")
+	-- Floor the base delay so a misconfigured 0/negative setting can't turn the
+	-- reconnect loop into a tight busy-loop that hammers the server.
+	local baseDelay = math.max(Settings:get("instantReconnectBaseDelay"), 0.1)
 	local delay = math.min(baseDelay * 2 ^ (self.__reconnectAttempt - 1), 30)
 	-- Add jitter (+/-15%) to avoid synchronized reconnect storms.
 	delay *= 0.85 + math.random() * 0.3
+	delay = math.max(delay, 0.1)
 
 	-- Reflect the transient state in the UI, but only re-fire the status change
 	-- when leaving Connected so we don't spam a notification on every attempt.

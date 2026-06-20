@@ -53,9 +53,12 @@ impl RestartCommand {
             );
         };
 
-        // If a server is genuinely running, ask it to stop and wait for it to go
-        // away before we start a replacement on the same address.
-        if serve_control::probe(state.address, state.port).is_some() {
+        // If a server matching our recorded session is genuinely running, ask it
+        // to stop and wait for it to go away before starting a replacement.
+        // `discover_running` validates the session id, so a stale state file
+        // pointing at a *different* server now on that port won't make us stop a
+        // stranger — we just treat it as not-running and start fresh.
+        if serve_control::discover_running(&root_dir).is_some() {
             serve_control::request_stop(state.address, state.port, state.session_id)?;
             if !serve_control::wait_until_offline(state.address, state.port, STOP_WAIT) {
                 anyhow::bail!(
@@ -98,12 +101,23 @@ impl RestartCommand {
                 .arg(state.allowed_hosts.join(","));
         }
 
-        // Detach: the server should outlive this short-lived `restart` process
-        // and not hold onto our terminal.
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        // Detach so the server outlives this short-lived process and doesn't
+        // hold the terminal, and capture its stderr to a log so a failed
+        // background start isn't invisible.
+        let rojo_dir = root_dir.join(".rojo");
+        let _ = fs_err::create_dir_all(&rojo_dir);
+        let log_path = rojo_dir.join("serve.log");
+
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+        match std::fs::File::create(&log_path) {
+            Ok(log) => {
+                command.stderr(Stdio::from(log));
+            }
+            Err(_) => {
+                command.stderr(Stdio::null());
+            }
+        }
+        detach(&mut command);
 
         let child = command
             .spawn()
@@ -111,7 +125,14 @@ impl RestartCommand {
         let pid = child.id();
 
         if !serve_control::wait_until_online(state.address, state.port, START_WAIT) {
-            anyhow::bail!("Started a new Rojo server, but it did not come online in time.");
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let log = log.trim();
+            if log.is_empty() {
+                anyhow::bail!(
+                    "Started a new Rojo server (pid {pid}), but it did not come online in time."
+                );
+            }
+            anyhow::bail!("The new Rojo server failed to start:\n{log}");
         }
 
         output::emit(
@@ -131,4 +152,24 @@ impl RestartCommand {
             },
         )
     }
+}
+
+/// Puts the spawned server in its own process group / detached state so a
+/// Ctrl-C or terminal-close aimed at this short-lived `restart` process in the
+/// brief window before it exits can't also kill the new server.
+fn detach(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    // Other platforms: no-op; a normally-exiting parent doesn't kill children.
+    let _ = command;
 }

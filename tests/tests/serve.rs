@@ -118,6 +118,27 @@ fn stop_shuts_down_server() {
     });
 }
 
+/// Stopping must not hang while a Studio plugin's WebSocket subscription is open
+/// (the common case for `rojo restart`). hyper completes the upgraded connection
+/// at upgrade time, so graceful shutdown doesn't wait on it — this locks that in.
+#[test]
+fn stop_shuts_down_with_active_socket() {
+    run_serve_test("empty", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+
+        let url = format!("ws://localhost:{}/api/socket/0", session.port());
+        let (mut socket, _response) =
+            hyper_tungstenite::tungstenite::connect(url).expect("Failed to open WebSocket");
+
+        // Stop while the subscription is open: must return promptly, not hang.
+        let response = session.post_api_stop(info.session_id);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        session.wait_until_offline();
+        let _ = socket.close(None);
+    });
+}
+
 #[test]
 fn allows_api_open_from_loopback_peer() {
     run_serve_test("empty", |session, _redactions| {

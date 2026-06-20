@@ -62,10 +62,11 @@ impl ServeCommand {
 
         // Load the project just to learn its root directory, so we can read any
         // prior serve-state and decide whether to reuse its session id before
-        // building the (more expensive) ServeSession.
-        let root_dir = Project::load_initial_project(&vfs, project_ref)?
-            .folder_location()
-            .to_path_buf();
+        // building the (more expensive) ServeSession. Canonicalized so the
+        // serve-state location matches what `status`/`stop`/`restart` compute.
+        let root_dir = state_file::canonical_dir(
+            Project::load_initial_project(&vfs, project_ref)?.folder_location(),
+        );
 
         // Reuse the session id from a prior serve session (if one exited without
         // cleaning up) so connected plugins reconnect seamlessly across a
@@ -131,8 +132,10 @@ impl ServeCommand {
         server.start((ip, port).into(), allowed_hosts, on_listening)?;
 
         // The server only returns here on a graceful shutdown (e.g. via
-        // `rojo stop`/`rojo restart`). Clean up the serve-state file.
-        state_file::remove(&root_dir);
+        // `rojo stop`/`rojo restart`). Clean up our serve-state file, but only if
+        // it still describes us — a `restart` successor may have already written
+        // its own, and we must not delete that.
+        state_file::remove_if_pid(&root_dir, std::process::id());
 
         Ok(())
     }

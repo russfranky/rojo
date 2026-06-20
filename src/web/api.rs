@@ -137,7 +137,16 @@ impl ApiService {
         }
 
         let accepts_json = accepts_json(&request);
-        let body = body::to_bytes(request.into_body()).await.unwrap();
+        let body = match body::to_bytes(request.into_body()).await {
+            Ok(body) => body,
+            Err(err) => {
+                return negotiate(
+                    accepts_json,
+                    ErrorResponse::bad_request(format!("Failed to read request body: {}", err)),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
 
         let stop_request: StopRequest = match serde_json::from_slice(&body) {
             Ok(request) => request,

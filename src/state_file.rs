@@ -94,6 +94,31 @@ pub fn remove(project_root: &Path) {
     }
 }
 
+/// Removes the serve-state file only if it still describes process `pid`.
+///
+/// A shutting-down server must not delete a state file written by a *successor*
+/// (e.g. during `rojo restart`, where the replacement reuses the same session
+/// id and writes its own state before the old server finishes draining). The
+/// pid distinguishes them.
+pub fn remove_if_pid(project_root: &Path, pid: u32) {
+    match load(project_root) {
+        Some(state) if state.pid == pid => remove(project_root),
+        Some(_) => {
+            log::debug!("Leaving serve-state file in place; it now belongs to another process",)
+        }
+        None => {}
+    }
+}
+
+/// Canonicalizes a directory so the same project resolves to the same
+/// serve-state location regardless of symlinks, `.`/`..`, or trailing slashes.
+/// Both `rojo serve` (writer) and `status`/`stop`/`restart` (readers) run paths
+/// through this so they agree. Falls back to the path unchanged when it can't be
+/// canonicalized (e.g. it does not exist yet).
+pub fn canonical_dir(path: &Path) -> PathBuf {
+    fs_err::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Returns the current Unix timestamp in seconds, or 0 if the clock is set
 /// before the epoch.
 pub fn now_unix() -> u64 {

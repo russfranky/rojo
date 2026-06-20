@@ -194,12 +194,15 @@ pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
 pub(super) fn resolve_project_root(path: &Path) -> anyhow::Result<std::path::PathBuf> {
     let path = resolve_path(path)?;
 
-    if path.is_file() {
-        Ok(path
-            .parent()
+    let dir = if path.is_file() {
+        path.parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf()))
+            .unwrap_or_else(|| path.to_path_buf())
     } else {
-        Ok(path.to_path_buf())
-    }
+        path.to_path_buf()
+    };
+
+    // Canonicalize so the serve-state location matches what `rojo serve` wrote,
+    // regardless of symlinks, `.`/`..`, or trailing slashes.
+    Ok(crate::state_file::canonical_dir(&dir))
 }

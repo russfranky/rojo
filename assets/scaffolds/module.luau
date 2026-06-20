@@ -1,6 +1,6 @@
 --!strict
 -- {name} module
 
-local {name} = {}
+local {identifier} = {}
 
-return {name}
+return {identifier}

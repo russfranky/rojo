@@ -62,6 +62,8 @@ struct GenResult {
 
 impl GenScriptCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
+        validate_name(&self.name)?;
+
         let dir = match &self.path {
             Some(path) => path.clone(),
             None => {
@@ -138,11 +140,59 @@ impl FromStr for ScriptKind {
     }
 }
 
-/// Render a template by substituting placeholders.
+/// Validates that a script name is a single, safe filename component. The name
+/// is interpolated into both a path and (for modules) Luau source, and is
+/// reachable from the AI-facing MCP `gen_script` tool, so it must not be able to
+/// escape the target directory or smuggle template placeholders.
+fn validate_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("Script name cannot be empty.");
+    }
+
+    if name.contains(['/', '\\', ':', '{', '}']) || name.contains("..") {
+        anyhow::bail!(
+            "Invalid script name '{name}': names cannot contain path separators, '..', ':', or braces."
+        );
+    }
+
+    if name.chars().any(char::is_control) {
+        anyhow::bail!("Invalid script name '{name}': names cannot contain control characters.");
+    }
+
+    if name != name.trim() || name.starts_with('.') || name.ends_with('.') {
+        anyhow::bail!(
+            "Invalid script name '{name}': names cannot start or end with a dot or whitespace."
+        );
+    }
+
+    Ok(())
+}
+
+/// Whether `name` is a valid Luau identifier (so it can be used as a `local`
+/// binding). Names that aren't fall back to a generic identifier in the module
+/// template so generated code always compiles.
+fn is_valid_luau_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Render a template by substituting placeholders. `{name}` is substituted last
+/// so a user-supplied name can never re-trigger another placeholder.
 fn render(template: &str, name: &str) -> String {
+    let identifier = if is_valid_luau_identifier(name) {
+        name
+    } else {
+        "module"
+    };
+
     template
-        .replace("{name}", name)
+        .replace("{identifier}", identifier)
         .replace("{rojo_version}", env!("CARGO_PKG_VERSION"))
+        .replace("{name}", name)
 }
 
 /// Writes a file only if it does not already exist. Returns whether it was

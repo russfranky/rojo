@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
 use serde::Serialize;
 
 use crate::{
@@ -29,20 +28,27 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 /// drains in-flight connections.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Builds the base URL to reach a server bound to `address:port`. Unspecified
-/// binds (`0.0.0.0` / `::`) are probed over loopback, which is reachable.
-fn base_url(address: IpAddr, port: u16) -> String {
-    let address = if address.is_unspecified() {
-        match address {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+/// Candidate addresses to reach a server bound to `address`. Unspecified binds
+/// (`0.0.0.0` / `::`) are reached over loopback; a `::` bind is tried on both
+/// IPv6 and IPv4 loopback because whether IPv4 is mapped into a `::` socket is
+/// platform-dependent (`bindv6only`).
+fn candidate_addresses(address: IpAddr) -> Vec<IpAddr> {
+    match address {
+        IpAddr::V4(a) if a.is_unspecified() => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        IpAddr::V6(a) if a.is_unspecified() => {
+            vec![
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ]
         }
-    } else {
-        address
-    };
+        other => vec![other],
+    }
+}
 
-    // SocketAddr's Display bracket-wraps IPv6 addresses correctly for URLs.
-    format!("http://{}", SocketAddr::new(address, port))
+/// Builds a URL for `path` against a candidate address. `SocketAddr`'s Display
+/// bracket-wraps IPv6 addresses correctly for URLs.
+fn url_for(address: IpAddr, port: u16, path: &str) -> String {
+    format!("http://{}{}", SocketAddr::new(address, port), path)
 }
 
 /// Probes `address:port` for a live Rojo server, returning its health info if
@@ -54,18 +60,26 @@ pub fn probe(address: IpAddr, port: u16) -> Option<HealthResponse> {
         .build()
         .ok()?;
 
-    let url = format!("{}/api/health", base_url(address, port));
-    let response = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .ok()?;
+    for addr in candidate_addresses(address) {
+        let url = url_for(addr, port, "/api/health");
+        let Ok(response) = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+        else {
+            continue;
+        };
 
-    if !response.status().is_success() {
-        return None;
+        if !response.status().is_success() {
+            continue;
+        }
+
+        if let Ok(health) = response.json::<HealthResponse>() {
+            return Some(health);
+        }
     }
 
-    response.json::<HealthResponse>().ok()
+    None
 }
 
 #[derive(Serialize)]
@@ -82,22 +96,36 @@ pub fn request_stop(address: IpAddr, port: u16, session_id: SessionId) -> anyhow
         .timeout(STOP_TIMEOUT)
         .build()?;
 
-    let url = format!("{}/api/stop", base_url(address, port));
-    let response = client
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&StopBody { session_id })
-        .send()
-        .context("Failed to contact the running Rojo server")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "The Rojo server refused the stop request (HTTP {})",
-            response.status()
-        );
+    let mut last_err = None;
+    for addr in candidate_addresses(address) {
+        let url = url_for(addr, port, "/api/stop");
+        match client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&StopBody { session_id })
+            .send()
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    return Ok(());
+                }
+                // We reached a server but it refused (e.g. wrong session id);
+                // that's authoritative, so don't try other candidates.
+                anyhow::bail!(
+                    "The Rojo server refused the stop request (HTTP {})",
+                    response.status()
+                );
+            }
+            Err(err) => last_err = Some(err),
+        }
     }
 
-    Ok(())
+    match last_err {
+        Some(err) => {
+            Err(anyhow::Error::new(err).context("Failed to contact the running Rojo server"))
+        }
+        None => anyhow::bail!("Failed to contact the running Rojo server"),
+    }
 }
 
 /// Loads the serve-state for `root_dir` and probes it, returning both only if a

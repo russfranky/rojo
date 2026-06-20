@@ -71,30 +71,66 @@ struct RojoMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// Mutating tools, hidden and rejected in `--read-only` mode.
+const MUTATING_TOOLS: [&str; 4] = ["build", "gen_script", "stop", "restart"];
+
 impl RojoMcpServer {
     fn new(work_dir: PathBuf, read_only: bool) -> Self {
+        let mut tool_router = Self::tool_router();
+
+        // In read-only mode, hide the mutating tools entirely (rmcp also rejects
+        // calls to disabled routes), so the model never sees or attempts them.
+        if read_only {
+            for name in MUTATING_TOOLS {
+                tool_router.disable_route(name);
+            }
+        }
+
         Self {
             work_dir,
             read_only,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
-    /// Runs `rojo <args>` in the project directory and returns stdout, or an
-    /// error string suitable for returning to the AI as the tool result.
-    fn run_rojo(&self, args: &[&str]) -> String {
-        match run_rojo_command(&self.work_dir, args) {
-            Ok(output) => output,
-            Err(err) => format!("Error: {err}"),
+    /// Runs `rojo <args>` in the project directory, returning stdout on success
+    /// or an error message (which the tool surfaces as an `is_error` result).
+    fn run_rojo(&self, args: &[&str]) -> Result<String, String> {
+        run_rojo_command(&self.work_dir, args)
+    }
+
+    /// Backstop for read-only mode (the route is also disabled in `new`).
+    fn ensure_writable(&self) -> Result<(), String> {
+        if self.read_only {
+            Err(
+                "This tool is disabled because the MCP server is running in --read-only mode."
+                    .to_string(),
+            )
+        } else {
+            Ok(())
         }
     }
 
-    /// Returns a refusal message when running read-only, else `None`.
-    fn read_only_refusal(&self) -> Option<String> {
-        self.read_only.then(|| {
-            "This tool is disabled because the MCP server is running in --read-only mode."
-                .to_string()
-        })
+    /// Rejects a user-supplied path that could escape the project. Absolute
+    /// paths and any `..` component are refused. CLI users aren't restricted;
+    /// this guards the AI-facing MCP surface against arbitrary file writes.
+    fn confine(&self, path: &str) -> Result<(), String> {
+        let candidate = Path::new(path);
+
+        if candidate.is_absolute() {
+            return Err(format!(
+                "Path '{path}' must be relative to the project, not absolute."
+            ));
+        }
+
+        if candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("Path '{path}' must not contain '..'."));
+        }
+
+        Ok(())
     }
 }
 
@@ -130,7 +166,7 @@ impl RojoMcpServer {
                        instances to their source files. The best tool for understanding and \
                        navigating the project's structure."
     )]
-    fn sourcemap(&self, Parameters(args): Parameters<SourcemapArgs>) -> String {
+    fn sourcemap(&self, Parameters(args): Parameters<SourcemapArgs>) -> Result<String, String> {
         let mut rojo_args = vec!["sourcemap"];
         if args.include_non_scripts {
             rojo_args.push("--include-non-scripts");
@@ -142,18 +178,17 @@ impl RojoMcpServer {
         description = "Report whether a Rojo server is running for the project, with its \
                        address, port, uptime, and connected-client count (JSON)."
     )]
-    fn status(&self) -> String {
+    fn status(&self) -> Result<String, String> {
         self.run_rojo(&["status", "--json"])
     }
 
     #[tool(
         description = "Build the project into a Roblox place or model file. Provide an output \
-                       path ending in .rbxl, .rbxlx, .rbxm, or .rbxmx."
+                       path, relative to the project, ending in .rbxl, .rbxlx, .rbxm, or .rbxmx."
     )]
-    fn build(&self, Parameters(args): Parameters<BuildArgs>) -> String {
-        if let Some(refusal) = self.read_only_refusal() {
-            return refusal;
-        }
+    fn build(&self, Parameters(args): Parameters<BuildArgs>) -> Result<String, String> {
+        self.ensure_writable()?;
+        self.confine(&args.output)?;
         self.run_rojo(&["build", "--json", "--output", &args.output])
     }
 
@@ -161,10 +196,12 @@ impl RojoMcpServer {
         description = "Scaffold a new Luau script in the project. kind is 'server', 'client', \
                        or 'module'."
     )]
-    fn gen_script(&self, Parameters(args): Parameters<GenScriptArgs>) -> String {
-        if let Some(refusal) = self.read_only_refusal() {
-            return refusal;
+    fn gen_script(&self, Parameters(args): Parameters<GenScriptArgs>) -> Result<String, String> {
+        self.ensure_writable()?;
+        if let Some(path) = args.path.as_deref() {
+            self.confine(path)?;
         }
+
         let kind = args.kind.as_deref().unwrap_or("module");
         let mut rojo_args = vec![
             "gen",
@@ -182,10 +219,8 @@ impl RojoMcpServer {
     }
 
     #[tool(description = "Stop the running Rojo server for the project.")]
-    fn stop(&self) -> String {
-        if let Some(refusal) = self.read_only_refusal() {
-            return refusal;
-        }
+    fn stop(&self) -> Result<String, String> {
+        self.ensure_writable()?;
         self.run_rojo(&["stop", "--json"])
     }
 
@@ -193,10 +228,8 @@ impl RojoMcpServer {
         description = "Restart the running Rojo server, preserving its session id so a connected \
                        Studio plugin reconnects seamlessly."
     )]
-    fn restart(&self) -> String {
-        if let Some(refusal) = self.read_only_refusal() {
-            return refusal;
-        }
+    fn restart(&self) -> Result<String, String> {
+        self.ensure_writable()?;
         self.run_rojo(&["restart", "--json"])
     }
 }
@@ -206,11 +239,17 @@ impl ServerHandler for RojoMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.server_info = Implementation::new("rojo", env!("CARGO_PKG_VERSION"));
-        info.instructions = Some(
-            "Rojo MCP server. Tools: sourcemap (instance tree), status, build, gen_script, \
-             stop, restart. Use sourcemap first to understand the project."
-                .to_string(),
-        );
+
+        let tools = if self.read_only {
+            "sourcemap (instance tree), status"
+        } else {
+            "sourcemap (instance tree), status, build, gen_script, stop, restart"
+        };
+        let mode = if self.read_only { " (read-only)" } else { "" };
+        info.instructions = Some(format!(
+            "Rojo MCP server{mode}. Tools: {tools}. Use sourcemap first to understand the project."
+        ));
+
         info
     }
 }

@@ -204,8 +204,15 @@ rojo status --json
 
 `rojo mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
 server over stdio, exposing Rojo's tooling to MCP clients (AI assistants and
-editors). It is a thin wrapper that drives Rojo's own CLI, so its tools behave
-exactly like the commands above.
+editors).
+
+The read tools an assistant calls repeatedly while exploring a project
+(`sourcemap`, `read_instance`) are answered from a single long-lived,
+file-watching session held in memory, so they don't rebuild the instance tree on
+every call and they reflect edits as soon as the file watcher picks them up. The
+remaining tools (`build`, `gen_script`, and the `status`/`stop`/`restart` server
+controls) drive Rojo's own CLI, so they behave exactly like the commands above
+and `build` always reads fresh from disk.
 
 It is **opt-in at build time** because its dependencies require a newer Rust
 toolchain than Rojo's minimum supported version:
@@ -225,6 +232,7 @@ rojo mcp [PROJECT] [--read-only]
 | Tool | Mutating | Description |
 | --- | --- | --- |
 | `sourcemap` | no | The project's instance tree (best for navigation). |
+| `read_instance` | no | One instance's class, property values, and immediate children, located by a slash-separated path from the root (e.g. `ReplicatedStorage/Shared/MyModule`). |
 | `status` | no | Whether a server is running, and its details. |
 | `build` | yes | Build the project to a `.rbxl`/`.rbxlx`/`.rbxm`/`.rbxmx` file. |
 | `gen_script` | yes | Scaffold a server/client/module script. |
@@ -233,9 +241,9 @@ rojo mcp [PROJECT] [--read-only]
 
 ### Read-only mode
 
-`--read-only` exposes only the non-mutating tools (`sourcemap`, `status`); the
-mutating tools are hidden and rejected. This is the safe default for untrusted
-sessions.
+`--read-only` exposes only the non-mutating tools (`sourcemap`, `read_instance`,
+`status`); the mutating tools are hidden and rejected. This is the safe default
+for untrusted sessions.
 
 ### Safety
 
@@ -276,4 +284,4 @@ MessagePack by default, or JSON when the request sends `Accept: application/json
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/health`, `/api/status` | Session id, server/protocol version, project name, uptime, connected-client count. |
-| `POST` | `/api/stop` | Gracefully shut down the server. Local-only and guarded by the current session id. |
+| `POST` | `/api/stop` | Gracefully shut down the server. Local-only; guarded by the current session id, and by the process id too when the caller provides one (so a stop aimed at a restarted server's predecessor can't hit its successor). |

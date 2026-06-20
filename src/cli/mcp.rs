@@ -96,7 +96,7 @@ struct RojoMcpServer {
 }
 
 /// Mutating tools, hidden and rejected in `--read-only` mode.
-const MUTATING_TOOLS: [&str; 4] = ["build", "gen_script", "stop", "restart"];
+const MUTATING_TOOLS: [&str; 5] = ["build", "gen_script", "stop", "restart", "reset_studio"];
 
 impl RojoMcpServer {
     fn new(work_dir: PathBuf, session: Arc<ServeSession>, read_only: bool) -> Self {
@@ -287,6 +287,14 @@ struct BuildArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ResetStudioArgs {
+    /// Optional place file to open in Studio after relaunching, relative to the
+    /// project. Omit it to launch Studio to its start screen.
+    #[serde(default)]
+    place: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GenScriptArgs {
     /// Name of the script to create, without extension.
     name: String,
@@ -401,6 +409,28 @@ impl RojoMcpServer {
         self.ensure_writable()?;
         self.run_rojo(&["restart", "--json"])
     }
+
+    #[tool(
+        description = "Force-restart Roblox Studio with no native dialogs (macOS only): kills \
+                       Studio, deletes its auto-recovery files so no 'restore' prompt appears, \
+                       and relaunches it. Optionally open a place file (relative to the project). \
+                       Use this to reboot Studio unattended; the Rojo plugin reconnects to the \
+                       running server on its own."
+    )]
+    fn reset_studio(
+        &self,
+        Parameters(args): Parameters<ResetStudioArgs>,
+    ) -> Result<String, String> {
+        self.ensure_writable()?;
+
+        let mut rojo_args = vec!["studio", "reset", "--json"];
+        if let Some(place) = args.place.as_deref() {
+            self.confine(place)?;
+            rojo_args.push("--place");
+            rojo_args.push(place);
+        }
+        self.run_rojo(&rojo_args)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -412,7 +442,8 @@ impl ServerHandler for RojoMcpServer {
         let tools = if self.read_only {
             "sourcemap (instance tree), read_instance, status"
         } else {
-            "sourcemap (instance tree), read_instance, status, build, gen_script, stop, restart"
+            "sourcemap (instance tree), read_instance, status, build, gen_script, stop, restart, \
+             reset_studio"
         };
         let mode = if self.read_only { " (read-only)" } else { "" };
         info.instructions = Some(format!(

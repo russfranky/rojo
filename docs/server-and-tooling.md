@@ -119,6 +119,59 @@ current terminal instead.
 
 ---
 
+## Rebooting Studio unattended (`rojo studio reset`)
+
+**macOS only.** Rebooting Roblox Studio normally needs a human to click two
+native dialogs: **"Don't Save"** when closing with unsaved changes, and the
+auto-recovery **"restore"** prompt on the next launch. That stalls an agent
+driving a serve/test loop. `rojo studio reset` force-restarts Studio without
+either dialog:
+
+1. **Force-kills** Studio (`SIGKILL`) — a killed process can't raise the "Don't
+   Save" prompt.
+2. **Deletes the auto-recovery files** — with nothing to restore, the restore
+   prompt has nothing to offer. (There is no Studio setting that disables it, so
+   removing the files is the only reliable suppression.)
+3. **Relaunches** Studio. A connected Rojo plugin reconnects to the still-running
+   `rojo serve` on its own, because the [session id](#stable-session-id-across-restarts)
+   is preserved across the reboot.
+
+This is OS-level automation (Rojo's Luau plugin can't dismiss native dialogs, and
+the recovery prompt appears before any plugin even loads), which is why it is a
+separate, platform-specific command. On other platforms it exits with a clear
+"only supported on macOS" message.
+
+```
+rojo studio reset [PROJECT] [--place <FILE>] [--no-launch] [--no-clear-recovery]
+                  [--recovery-path <DIR>] [--restart-serve] [--json]
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--place <FILE>` | Open this place file after relaunching (otherwise Studio opens to its start screen). |
+| `--no-launch` | Kill and clear recovery, but don't relaunch. |
+| `--no-clear-recovery` | Leave the auto-recovery files in place (the restore prompt may then reappear). |
+| `--recovery-path <DIR>` | Override the auto-recovery directory (see below). |
+| `--restart-serve` | Also restart the project's `rojo serve` (best-effort), for a full reset of the connection. `PROJECT` selects which server. |
+
+```json
+{ "killed": true, "recoveryClearedCount": 2, "serveRestarted": false, "relaunched": true }
+```
+
+> **Clearing recovery is destructive by design.** It deletes Studio's
+> auto-recovery backups so the prompt can't appear — intended for a test loop
+> where Rojo's source files are the source of truth, not Studio. Use
+> `--no-clear-recovery` to keep them.
+
+**Recovery path & process name.** The default recovery directory is Studio's
+macOS AutoSaves folder,
+`~/Library/Application Support/Roblox/RobloxStudio/AutoSaves`, and Studio is
+matched by the process name `RobloxStudio`. Both can change across Studio
+versions; if the restore prompt still appears, find the real directory (look for
+recently-modified files there after a crash) and pass it with `--recovery-path`.
+
+---
+
 ## `rojo test`
 
 Runs a project's Luau tests with a pluggable runner. Rojo does not ship a Luau
@@ -262,9 +315,9 @@ The read tools an assistant calls repeatedly while exploring a project
 (`sourcemap`, `read_instance`) are answered from a single long-lived,
 file-watching session held in memory, so they don't rebuild the instance tree on
 every call and they reflect edits as soon as the file watcher picks them up. The
-remaining tools (`build`, `gen_script`, and the `status`/`stop`/`restart` server
-controls) drive Rojo's own CLI, so they behave exactly like the commands above
-and `build` always reads fresh from disk.
+remaining tools (`build`, `gen_script`, the `status`/`stop`/`restart` server
+controls, and `reset_studio`) drive Rojo's own CLI, so they behave exactly like
+the commands above and `build` always reads fresh from disk.
 
 It is **opt-in at build time** because its dependencies require a newer Rust
 toolchain than Rojo's minimum supported version:
@@ -290,6 +343,7 @@ rojo mcp [PROJECT] [--read-only]
 | `gen_script` | yes | Scaffold a server/client/module script. |
 | `stop` | yes | Stop the running server. |
 | `restart` | yes | Restart the running server. |
+| `reset_studio` | yes | Force-restart Roblox Studio with no native dialogs (macOS only); optionally open a place. See [`rojo studio reset`](#rebooting-studio-unattended-rojo-studio-reset). |
 
 ### Read-only mode
 
@@ -299,9 +353,9 @@ for untrusted sessions.
 
 ### Safety
 
-Tool file paths (`build` output, `gen_script` path) are confined to the project
-directory — absolute paths and `..` are rejected. Tool failures are reported as
-MCP errors rather than silently succeeding.
+Tool file paths (`build` output, `gen_script` path, `reset_studio` place) are
+confined to the project directory — absolute paths and `..` are rejected. Tool
+failures are reported as MCP errors rather than silently succeeding.
 
 ### Registering with a client
 

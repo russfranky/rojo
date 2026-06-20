@@ -15,6 +15,7 @@ mod serve_control;
 mod sourcemap;
 mod status;
 mod stop;
+mod studio;
 mod syncback;
 mod test;
 mod upload;
@@ -38,6 +39,7 @@ pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
 pub use self::status::StatusCommand;
 pub use self::stop::StopCommand;
+pub use self::studio::{StudioCommand, StudioSubcommand};
 pub use self::syncback::SyncbackCommand;
 pub use self::test::TestCommand;
 pub use self::upload::UploadCommand;
@@ -68,6 +70,7 @@ impl Options {
             Subcommand::Syncback(subcommand) => subcommand.run(self.global),
             Subcommand::Status(subcommand) => subcommand.run(self.global),
             Subcommand::Stop(subcommand) => subcommand.run(self.global),
+            Subcommand::Studio(subcommand) => subcommand.run(self.global),
             Subcommand::Restart(subcommand) => subcommand.run(self.global),
             Subcommand::Test(subcommand) => subcommand.run(self.global),
             Subcommand::Gen(subcommand) => subcommand.run(self.global),
@@ -174,6 +177,7 @@ pub enum Subcommand {
     Syncback(SyncbackCommand),
     Status(StatusCommand),
     Stop(StopCommand),
+    Studio(StudioCommand),
     Restart(RestartCommand),
     Test(TestCommand),
     Gen(GenCommand),

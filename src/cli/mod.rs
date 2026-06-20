@@ -5,6 +5,8 @@ mod doc;
 mod fmt_project;
 mod gen;
 mod init;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod output;
 mod plugin;
 mod restart;
@@ -28,6 +30,8 @@ pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::gen::GenCommand;
 pub use self::init::{InitCommand, InitKind};
+#[cfg(feature = "mcp")]
+pub use self::mcp::McpCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
 pub use self::restart::RestartCommand;
 pub use self::serve::ServeCommand;
@@ -67,6 +71,8 @@ impl Options {
             Subcommand::Restart(subcommand) => subcommand.run(self.global),
             Subcommand::Test(subcommand) => subcommand.run(self.global),
             Subcommand::Gen(subcommand) => subcommand.run(self.global),
+            #[cfg(feature = "mcp")]
+            Subcommand::Mcp(subcommand) => subcommand.run(),
         }
     }
 }
@@ -164,6 +170,8 @@ pub enum Subcommand {
     Restart(RestartCommand),
     Test(TestCommand),
     Gen(GenCommand),
+    #[cfg(feature = "mcp")]
+    Mcp(McpCommand),
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {

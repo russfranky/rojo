@@ -31,6 +31,12 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Connection resilience: `rojo serve` now keeps a stable session id across restarts (recorded in a project-local `.rojo/serve-state.json`), and the Studio plugin automatically reconnects with exponential backoff when the connection drops, so server restarts and transient blips no longer require a manual reconnect. Added `GET /api/health`/`/api/status` and a local, session-id-guarded `POST /api/stop` control endpoint.
+* Added `rojo status`, `rojo stop`, and `rojo restart` to inspect and control a running server. `restart` preserves the session id so connected plugins reconnect seamlessly.
+* Added `rojo test`, a pluggable Luau test runner (`run-in-roblox`, `lune`, or a custom command).
+* Added `rojo gen script` to scaffold new server/client/module scripts from templates.
+* Added a global `--json` flag for machine-readable output on `build`, `sourcemap`, `status`, `stop`, `restart`, `test`, and `gen`.
+* Added an optional `rojo mcp` Model Context Protocol server (build with `--features mcp`) that exposes Rojo's tooling to AI assistants over stdio, including a `--read-only` inspector mode.
 * `inf` and `nan` values in properties are now synced ([#1176])
 * Fixed a bug caused by having reference properties (such as `ObjectValue.Value`) that point to an Instance not included in syncback. ([#1179])
 * Fixed instance replacement fallback failing when too many instances needed to be replaced. ([#1192])

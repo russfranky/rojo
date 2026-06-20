@@ -185,12 +185,38 @@ impl TestServeSession {
         Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
     }
 
-    /// Sends a POST to `/api/stop` with the given session id (as JSON, like the
-    /// CLI does) and returns the response.
+    /// The OS process id of the running `rojo serve`, i.e. the pid the server
+    /// reports as `std::process::id()`.
+    pub fn pid(&self) -> u32 {
+        self.rojo_process.0.id()
+    }
+
+    /// Sends a POST to `/api/stop` with the given session id and no pid (the
+    /// back-compat path older clients use) and returns the response.
     pub fn post_api_stop(&self, session_id: SessionId) -> reqwest::blocking::Response {
+        self.post_api_stop_body(&StopRequest {
+            session_id,
+            pid: None,
+        })
+    }
+
+    /// Sends a POST to `/api/stop` with both a session id and an explicit pid,
+    /// as the CLI does, and returns the response.
+    pub fn post_api_stop_with_pid(
+        &self,
+        session_id: SessionId,
+        pid: u32,
+    ) -> reqwest::blocking::Response {
+        self.post_api_stop_body(&StopRequest {
+            session_id,
+            pid: Some(pid),
+        })
+    }
+
+    fn post_api_stop_body(&self, request: &StopRequest) -> reqwest::blocking::Response {
         let client = reqwest::blocking::Client::new();
         let url = format!("http://localhost:{}/api/stop", self.port);
-        let body = serde_json::to_vec(&StopRequest { session_id }).unwrap();
+        let body = serde_json::to_vec(request).unwrap();
 
         client
             .post(url)

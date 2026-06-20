@@ -100,6 +100,15 @@ pub fn remove(project_root: &Path) {
 /// (e.g. during `rojo restart`, where the replacement reuses the same session
 /// id and writes its own state before the old server finishes draining). The
 /// pid distinguishes them.
+///
+/// The load→remove pair is not atomic: a successor could overwrite the file in
+/// the window between us reading the pid and unlinking it, in which case we'd
+/// delete the successor's record. This race is accepted rather than locked
+/// against because it is self-healing — a missing state file only makes the
+/// next `status`/`stop`/`restart` treat the project as not-running, and the
+/// successor re-probes and rewrites its state on demand. We keep the window
+/// small by re-reading the pid here (immediately before unlinking) rather than
+/// trusting a pid captured earlier in shutdown.
 pub fn remove_if_pid(project_root: &Path, pid: u32) {
     match load(project_root) {
         Some(state) if state.pid == pid => remove(project_root),

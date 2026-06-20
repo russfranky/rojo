@@ -132,6 +132,31 @@ impl RojoMcpServer {
 
         Ok(())
     }
+
+    /// Rejects a build output path whose extension isn't one Rojo can produce.
+    /// `rojo build` enforces this too, but checking here gives the model a clear,
+    /// fast error (and an explicit list of choices) instead of a subprocess
+    /// failure, and avoids touching the filesystem on an obvious mistake.
+    fn require_build_extension(&self, output: &str) -> Result<(), String> {
+        const VALID_EXTENSIONS: [&str; 4] = ["rbxl", "rbxlx", "rbxm", "rbxmx"];
+
+        let extension = Path::new(output)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase);
+
+        match extension {
+            Some(ext) if VALID_EXTENSIONS.contains(&ext.as_str()) => Ok(()),
+            _ => Err(format!(
+                "Output '{output}' must end in one of: {}.",
+                VALID_EXTENSIONS
+                    .iter()
+                    .map(|ext| format!(".{ext}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -189,6 +214,7 @@ impl RojoMcpServer {
     fn build(&self, Parameters(args): Parameters<BuildArgs>) -> Result<String, String> {
         self.ensure_writable()?;
         self.confine(&args.output)?;
+        self.require_build_extension(&args.output)?;
         self.run_rojo(&["build", "--json", "--output", &args.output])
     }
 
@@ -274,5 +300,41 @@ fn run_rojo_command(work_dir: &Path, args: &[&str]) -> Result<String, String> {
             args.join(" "),
             stderr.trim()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> RojoMcpServer {
+        RojoMcpServer::new(PathBuf::from("."), false)
+    }
+
+    #[test]
+    fn build_extension_accepts_roblox_formats() {
+        let server = server();
+        for output in ["game.rbxl", "game.rbxlx", "model.rbxm", "model.rbxmx"] {
+            assert!(
+                server.require_build_extension(output).is_ok(),
+                "{output} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn build_extension_is_case_insensitive() {
+        assert!(server().require_build_extension("Game.RBXL").is_ok());
+    }
+
+    #[test]
+    fn build_extension_rejects_other_formats() {
+        let server = server();
+        for output in ["out.txt", "game.rbx", "noextension", "archive.zip"] {
+            assert!(
+                server.require_build_extension(output).is_err(),
+                "{output} should be rejected"
+            );
+        }
     }
 }

@@ -188,6 +188,13 @@ pub struct HealthResponse {
 #[serde(rename_all = "camelCase")]
 pub struct StopRequest {
     pub session_id: SessionId,
+
+    /// The pid the caller expects to stop. Because `rojo restart` reuses the
+    /// session id, the id alone can't tell a predecessor from a successor; when
+    /// present, the server also requires this to match its own pid. Optional for
+    /// back-compat with older clients that don't send it.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 /// Response body from /api/stop.

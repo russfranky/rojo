@@ -94,7 +94,32 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
+        // Lifecycle hooks wrap the build. They run for this initial build only;
+        // in `--watch` they are intentionally skipped on each rebuild so a hook
+        // that writes into the project can't trigger an endless rebuild loop.
+        let hooks = (!global.no_hooks)
+            .then(|| session.root_project().hooks.clone())
+            .flatten();
+
+        if let Some(hooks) = &hooks {
+            crate::hooks::run_event(
+                "preBuild",
+                &hooks.pre_build,
+                session.root_dir(),
+                global.json,
+            )?;
+        }
+
         write_model(&session, &output_path, output_kind, &global)?;
+
+        if let Some(hooks) = &hooks {
+            crate::hooks::run_event(
+                "postBuild",
+                &hooks.post_build,
+                session.root_dir(),
+                global.json,
+            )?;
+        }
 
         if self.watch {
             let rt = Runtime::new().context("Failed to start the async runtime for watch mode")?;

@@ -9,6 +9,7 @@ Model Context Protocol (MCP) server.
 - [`rojo test`](#rojo-test)
 - [`rojo gen`](#rojo-gen)
 - [Machine-readable output (`--json`)](#machine-readable-output---json)
+- [Project hooks](#project-hooks)
 - [The MCP server (`rojo mcp`)](#the-mcp-server-rojo-mcp)
 - [The serve-state file](#the-serve-state-file)
 - [HTTP API additions](#http-api-additions)
@@ -196,6 +197,57 @@ parseable. Supported by `build`, `sourcemap`, `status`, `stop`, `restart`,
 ```bash
 rojo build --json -o game.rbxl
 rojo status --json
+```
+
+---
+
+## Project hooks
+
+Hooks are commands Rojo runs at build and serve milestones, declared in the
+project file. They're for automation and CI: code generation, asset processing,
+linting, or notifications.
+
+```jsonc
+{
+  "name": "my-game",
+  "tree": { "$path": "src" },
+  "hooks": {
+    // Run before `rojo build` writes its output.
+    "preBuild": ["wally install"],
+    // Run after a successful `rojo build`.
+    "postBuild": [
+      "echo done",                       // a shell command line, or
+      ["cp", "game.rbxl", "dist/game.rbxl"]  // an explicit program + args
+    ],
+    // Run once `rojo serve` has bound its port.
+    "serve": ["echo serving"]
+  }
+}
+```
+
+Each event takes a list of commands run in order. A command is either a **string**
+(run through the platform shell — `sh -c` on Unix, `cmd /C` on Windows, so pipes
+and `&&` work) or an **array** of strings (a program and its arguments, run
+directly without a shell to avoid quoting concerns). Commands run with the project
+directory as their working directory.
+
+- A failing `preBuild`/`postBuild` command fails the build (non-zero exit).
+- A failing `serve` command is logged but does **not** stop an already-running
+  server.
+- In `rojo build --watch`, hooks run for the initial build only, not on each
+  rebuild — so a hook that writes into the project can't cause a rebuild loop.
+- With `--json`, hook output is routed to stderr so stdout stays parseable.
+
+### Trust model
+
+Hooks are arbitrary commands that run with your privileges, exactly like a
+`Makefile` target or an npm `postinstall` script. **Only run hooks for projects
+you trust.** The global `--no-hooks` flag disables all hooks for a single
+invocation, which is the safe choice when building or serving a project from an
+untrusted source:
+
+```bash
+rojo build --no-hooks -o game.rbxl
 ```
 
 ---

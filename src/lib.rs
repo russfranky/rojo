@@ -10,6 +10,7 @@ mod tree_view;
 mod auth_cookie;
 mod change_processor;
 mod glob;
+mod hooks;
 mod json;
 mod lua_ast;
 mod message_queue;
@@ -29,6 +30,7 @@ mod web;
 
 // TODO: Work out what we should expose publicly
 
+pub use hooks::{HookCommand, Hooks};
 pub use project::*;
 pub use rojo_ref::*;
 pub use session_id::SessionId;

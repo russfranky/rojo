@@ -94,6 +94,12 @@ pub struct GlobalOptions {
     /// AI tooling.
     #[clap(long, global(true))]
     pub json: bool,
+
+    /// Don't run any project lifecycle hooks (preBuild/postBuild/serve) for this
+    /// invocation. Hooks are arbitrary commands defined in the project file; use
+    /// this when working with a project you don't fully trust.
+    #[clap(long, global(true))]
+    pub no_hooks: bool,
 }
 
 impl Default for GlobalOptions {
@@ -102,6 +108,7 @@ impl Default for GlobalOptions {
             verbosity: 0,
             color: ColorChoice::Auto,
             json: false,
+            no_hooks: false,
         }
     }
 }

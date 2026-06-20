@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    glob::IgnorableGlob, json, resolution::UnresolvedValue, snapshot::SyncRule,
+    glob::IgnorableGlob, hooks::Hooks, json, resolution::UnresolvedValue, snapshot::SyncRule,
     syncback::SyncbackRules,
 };
 
@@ -135,6 +135,12 @@ pub struct Project {
     /// Globs are relative to the folder the project file is in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_rules: Vec<SyncRule>,
+
+    /// Lifecycle hooks: commands Rojo runs at build and serve milestones, for
+    /// automation and CI. Hooks are part of the project, like a `Makefile`, so
+    /// only run them for projects you trust; the `--no-hooks` flag disables them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Hooks>,
 
     /// The path to the file that this project came from. Relative paths in the
     /// project should be considered relative to the parent of this field, also

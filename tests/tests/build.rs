@@ -68,6 +68,64 @@ gen_build_tests! {
     plugin_init,
 }
 
+/// A `postBuild` hook should run after a successful build, and `--no-hooks`
+/// should skip it. Uses a shell hook that writes a marker file (portable across
+/// the `sh`/`cmd` used on the CI matrix) and checks for the marker's presence.
+#[test]
+fn build_runs_post_build_hook_unless_disabled() {
+    let _ = env_logger::try_init();
+
+    let dir = tempdir().expect("couldn't create temporary directory");
+    let project_dir = dir.path();
+
+    fs::write(
+        project_dir.join("default.project.json"),
+        r#"{
+            "name": "hooktest",
+            "hooks": { "postBuild": ["echo built > hook_marker.txt"] },
+            "tree": { "$className": "Folder" }
+        }"#,
+    )
+    .expect("couldn't write project file");
+
+    let output_path = project_dir.join("out.rbxmx");
+    let marker = project_dir.join("hook_marker.txt");
+
+    let build = |extra_args: &[&str]| {
+        let mut args = vec![
+            "build",
+            project_dir.to_str().unwrap(),
+            "-o",
+            output_path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra_args);
+        Command::new(ROJO_PATH)
+            .args(&args)
+            .env("RUST_LOG", "error")
+            .status()
+            .expect("couldn't start Rojo")
+    };
+
+    // Hooks enabled: the postBuild hook runs and creates the marker.
+    assert!(build(&[]).success(), "rojo build failed");
+    assert!(
+        marker.exists(),
+        "the postBuild hook should have created the marker file"
+    );
+
+    fs::remove_file(&marker).expect("couldn't remove marker");
+
+    // --no-hooks: the hook is skipped, so the marker is not recreated.
+    assert!(
+        build(&["--no-hooks"]).success(),
+        "rojo build --no-hooks failed"
+    );
+    assert!(
+        !marker.exists(),
+        "--no-hooks should have skipped the postBuild hook"
+    );
+}
+
 fn run_build_test(test_name: &str) {
     let working_dir = get_working_dir_path();
 

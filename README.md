@@ -29,6 +29,8 @@ Rojo enables:
 
 Rojo also has an optional two-way sync setting in the Studio plugin for syncing supported Studio edits back to the filesystem.
 
+It additionally provides resilient live sync (a stable session across server restarts and automatic plugin reconnect), daemon-control and developer-workflow commands (`status`, `stop`, `restart`, `test`, `gen`), machine-readable `--json` output, and an optional Model Context Protocol server (`rojo mcp`). See [Server Resilience, Daemon Control & the MCP Server](docs/server-and-tooling.md).
+
 Some workflows, like fully automatic conversion of every existing game into a Rojo project, are still limited and may require manual project configuration.
 
 ## [Documentation](https://rojo.space/docs)

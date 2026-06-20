@@ -34,7 +34,7 @@ impl StopCommand {
             });
         };
 
-        serve_control::request_stop(state.address, state.port, state.session_id)?;
+        serve_control::request_stop(state.address, state.port, state.session_id, state.pid)?;
 
         if !serve_control::wait_until_offline(state.address, state.port, STOP_WAIT) {
             anyhow::bail!("Asked the Rojo server to stop, but it is still responding.");

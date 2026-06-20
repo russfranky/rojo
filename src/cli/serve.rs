@@ -110,6 +110,19 @@ impl ServeCommand {
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         };
 
+        // Capture the serve hooks before the session is handed to the server, so
+        // they can run once the port is bound. Disabled by `--no-hooks`.
+        let serve_hooks = if global.no_hooks {
+            Vec::new()
+        } else {
+            session
+                .root_project()
+                .hooks
+                .as_ref()
+                .map(|hooks| hooks.serve.clone())
+                .unwrap_or_default()
+        };
+
         let server = LiveServer::new(session);
 
         let on_listening = {
@@ -125,6 +138,14 @@ impl ServeCommand {
                     let _ = output::print_json(&serve_state);
                 } else {
                     let _ = show_start_message(ip, port, global.color.into());
+                }
+
+                // Serve hooks run after a successful bind. A failing serve hook is
+                // logged but does not tear down an already-running server.
+                if let Err(err) =
+                    crate::hooks::run_event("serve", &serve_hooks, &root_dir, global.json)
+                {
+                    log::error!("serve hook failed: {err:#}");
                 }
             }
         };

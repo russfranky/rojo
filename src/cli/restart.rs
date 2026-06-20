@@ -59,7 +59,7 @@ impl RestartCommand {
         // pointing at a *different* server now on that port won't make us stop a
         // stranger — we just treat it as not-running and start fresh.
         if serve_control::discover_running(&root_dir).is_some() {
-            serve_control::request_stop(state.address, state.port, state.session_id)?;
+            serve_control::request_stop(state.address, state.port, state.session_id, state.pid)?;
             if !serve_control::wait_until_offline(state.address, state.port, STOP_WAIT) {
                 anyhow::bail!(
                     "Asked the existing Rojo server to stop, but it is still responding."

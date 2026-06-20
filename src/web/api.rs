@@ -168,6 +168,22 @@ impl ApiService {
             );
         }
 
+        // `rojo restart` deliberately reuses the session id across the
+        // predecessor and its successor, so the session id alone can't tell them
+        // apart. When the caller specifies which process it means to stop, also
+        // require that pid to match ours, so a stop aimed at a predecessor can
+        // never bring down the successor that replaced it. Older clients omit the
+        // pid; for them the session-id check stands alone (back-compat).
+        if let Some(pid) = stop_request.pid {
+            if pid != std::process::id() {
+                return negotiate(
+                    accepts_json,
+                    ErrorResponse::bad_request("Wrong pid"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        }
+
         self.serve_session.request_shutdown();
 
         negotiate(accepts_json, StopResponse { session_id }, StatusCode::OK)

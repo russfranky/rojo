@@ -86,12 +86,20 @@ pub fn probe(address: IpAddr, port: u16) -> Option<HealthResponse> {
 #[serde(rename_all = "camelCase")]
 struct StopBody {
     session_id: SessionId,
+    pid: u32,
 }
 
-/// Asks the server at `address:port` to shut down gracefully. `session_id` must
-/// match the running server's id (read from a probe or the serve-state file);
-/// the server rejects mismatches.
-pub fn request_stop(address: IpAddr, port: u16, session_id: SessionId) -> anyhow::Result<()> {
+/// Asks the server at `address:port` to shut down gracefully. `session_id` and
+/// `pid` must match the running server (both read from a probe or the
+/// serve-state file); the server rejects mismatches. Sending the `pid` keeps a
+/// stop aimed at a particular process from hitting a successor that reused the
+/// session id (e.g. after `rojo restart`).
+pub fn request_stop(
+    address: IpAddr,
+    port: u16,
+    session_id: SessionId,
+    pid: u32,
+) -> anyhow::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(STOP_TIMEOUT)
         .build()?;
@@ -102,7 +110,7 @@ pub fn request_stop(address: IpAddr, port: u16, session_id: SessionId) -> anyhow
         match client
             .post(&url)
             .header(reqwest::header::ACCEPT, "application/json")
-            .json(&StopBody { session_id })
+            .json(&StopBody { session_id, pid })
             .send()
         {
             Ok(response) => {

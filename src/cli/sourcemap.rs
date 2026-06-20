@@ -291,6 +291,30 @@ fn write_sourcemap(
     Ok(())
 }
 
+/// Builds the sourcemap for an already-running [`ServeSession`] and returns it as
+/// a JSON string (relative paths, matching `rojo sourcemap`'s default).
+///
+/// Used by the MCP server (`rojo mcp`) to answer the `sourcemap` tool from a
+/// live, in-memory session instead of spawning a subprocess that rebuilds the
+/// whole instance tree on every call.
+#[cfg(feature = "mcp")]
+pub(crate) fn sourcemap_json(
+    session: &ServeSession,
+    include_non_scripts: bool,
+) -> anyhow::Result<String> {
+    let filter = if include_non_scripts {
+        filter_nothing
+    } else {
+        filter_non_scripts
+    };
+
+    let tree = session.tree();
+    let root_node =
+        recurse_create_node(&tree, tree.get_root_id(), session.root_dir(), filter, false);
+
+    Ok(serde_json::to_string(&root_node)?)
+}
+
 #[cfg(test)]
 mod test {
     use crate::cli::sourcemap::SourcemapNode;

@@ -1,18 +1,24 @@
 //! The `rojo mcp` subcommand: a Model Context Protocol server, exposing Rojo's
 //! capabilities as tools for AI assistants over stdio.
 //!
-//! It is a thin wrapper that drives Rojo's own CLI (`rojo sourcemap`, `build`,
-//! `status`, `gen`, `stop`, `restart`) as subprocesses and returns their JSON
-//! output. Reusing the CLI keeps the tools consistent with what a developer runs
-//! by hand, and inherits all of their behavior and tests.
+//! Read tools that get called repeatedly while an assistant explores a project
+//! (`sourcemap`, `read_instance`) are answered from a single long-lived,
+//! file-watching [`ServeSession`] held in memory, so they never pay to rebuild
+//! the whole instance tree per call. The remaining tools (`build`, `gen_script`,
+//! and the `status`/`stop`/`restart` controls for a separate `rojo serve`
+//! daemon) drive Rojo's own CLI as subprocesses: that keeps them consistent with
+//! what a developer runs by hand, and lets `build` always read fresh from disk.
 
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use anyhow::Context;
 use clap::Parser;
+use memofs::Vfs;
+use rbx_dom_weak::types::{Ref, VariantType};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
@@ -21,7 +27,9 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 
-use super::resolve_project_root;
+use crate::{serve_session::ServeSession, snapshot::RojoTree};
+
+use super::{resolve_path, resolve_project_root};
 
 /// Runs an MCP server over stdio that exposes Rojo's tooling to AI assistants.
 #[derive(Debug, Parser)]
@@ -31,19 +39,32 @@ pub struct McpCommand {
     #[clap(default_value = "")]
     pub project: PathBuf,
 
-    /// Only expose read-only tools (sourcemap, status). Mutating tools (build,
-    /// gen, serve control) are refused. Safer for untrusted AI sessions.
+    /// Only expose read-only tools (sourcemap, read_instance, status). Mutating
+    /// tools (build, gen, serve control) are refused. Safer for untrusted AI
+    /// sessions.
     #[clap(long)]
     pub read_only: bool,
 }
 
 impl McpCommand {
     pub fn run(self) -> anyhow::Result<()> {
-        // Resolve the project to a working directory we run Rojo subprocesses in,
-        // so each subcommand's project/path defaults resolve correctly.
+        // Working directory for the subprocess-backed tools (build, gen, and the
+        // serve-daemon controls), so each subcommand's project/path defaults
+        // resolve correctly.
         let work_dir = resolve_project_root(&self.project)?;
 
-        let server = RojoMcpServer::new(work_dir, self.read_only);
+        // One long-lived, file-watching session backs the read tools so they
+        // answer from a live in-memory tree instead of rebuilding it per call.
+        // `Vfs::new_default` enables watching, so the session's ChangeProcessor
+        // keeps that tree current as files change on disk.
+        let project_path = fs_err::canonicalize(resolve_path(&self.project)?)?;
+        let vfs = Vfs::new_default()?;
+        let session = Arc::new(
+            ServeSession::new(vfs, &project_path)
+                .context("Failed to open the Rojo project for the MCP server")?,
+        );
+
+        let server = RojoMcpServer::new(work_dir, session, self.read_only);
 
         let runtime = tokio::runtime::Runtime::new()
             .context("Failed to start the async runtime for the MCP server")?;
@@ -68,14 +89,17 @@ impl McpCommand {
 struct RojoMcpServer {
     work_dir: PathBuf,
     read_only: bool,
+    /// Long-lived, file-watching session backing the in-memory read tools
+    /// (`sourcemap`, `read_instance`).
+    session: Arc<ServeSession>,
     tool_router: ToolRouter<Self>,
 }
 
 /// Mutating tools, hidden and rejected in `--read-only` mode.
-const MUTATING_TOOLS: [&str; 4] = ["build", "gen_script", "stop", "restart"];
+const MUTATING_TOOLS: [&str; 5] = ["build", "gen_script", "stop", "restart", "reset_studio"];
 
 impl RojoMcpServer {
-    fn new(work_dir: PathBuf, read_only: bool) -> Self {
+    fn new(work_dir: PathBuf, session: Arc<ServeSession>, read_only: bool) -> Self {
         let mut tool_router = Self::tool_router();
 
         // In read-only mode, hide the mutating tools entirely (rmcp also rejects
@@ -89,6 +113,7 @@ impl RojoMcpServer {
         Self {
             work_dir,
             read_only,
+            session,
             tool_router,
         }
     }
@@ -132,6 +157,111 @@ impl RojoMcpServer {
 
         Ok(())
     }
+
+    /// Core of the `read_instance` tool, factored out so it can be unit-tested
+    /// without constructing the MCP `Parameters` wrapper. Reads the in-memory
+    /// tree; the lock is held only for this synchronous call and never spans an
+    /// await.
+    fn read_instance_json(&self, path: &str) -> Result<String, String> {
+        let tree = self.session.tree();
+
+        let id = resolve_instance_path(&tree, path).ok_or_else(|| {
+            format!("No instance found at path '{path}'. Run `sourcemap` to see valid paths.")
+        })?;
+        let instance = tree
+            .get_instance(id)
+            .expect("a resolved instance id must exist in the tree");
+
+        // Serialize each property independently and skip any that can't be
+        // represented as JSON (e.g. SharedString), so one exotic value can never
+        // fail the whole read.
+        let mut properties = serde_json::Map::new();
+        for (key, value) in instance.properties() {
+            if value.ty() == VariantType::SharedString {
+                continue;
+            }
+            if let Ok(json) = serde_json::to_value(value) {
+                properties.insert(key.to_string(), json);
+            }
+        }
+
+        let children: Vec<ChildView> = instance
+            .children()
+            .iter()
+            .filter_map(|&child_id| {
+                tree.get_instance(child_id).map(|child| ChildView {
+                    name: child.name().to_owned(),
+                    class_name: child.class_name().to_string(),
+                })
+            })
+            .collect();
+
+        let view = InstanceView {
+            name: instance.name().to_owned(),
+            class_name: instance.class_name().to_string(),
+            properties,
+            children,
+        };
+
+        serde_json::to_string(&view).map_err(|err| err.to_string())
+    }
+}
+
+/// Rejects a build output path whose extension isn't one Rojo can produce.
+/// `rojo build` enforces this too, but checking here gives the model a clear,
+/// fast error (and an explicit list of choices) instead of a subprocess failure,
+/// and avoids touching the filesystem on an obvious mistake.
+fn require_build_extension(output: &str) -> Result<(), String> {
+    const VALID_EXTENSIONS: [&str; 4] = ["rbxl", "rbxlx", "rbxm", "rbxmx"];
+
+    let extension = Path::new(output)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+
+    match extension {
+        Some(ext) if VALID_EXTENSIONS.contains(&ext.as_str()) => Ok(()),
+        _ => Err(format!(
+            "Output '{output}' must end in one of: {}.",
+            VALID_EXTENSIONS
+                .iter()
+                .map(|ext| format!(".{ext}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Resolves a slash-separated instance path to a referent, walking the tree by
+/// child name from the root. An empty path is the root itself; the root's own
+/// name is accepted as an optional leading segment, so a path copied from a
+/// `sourcemap` (which shows the root at the top) resolves too.
+fn resolve_instance_path(tree: &RojoTree, path: &str) -> Option<Ref> {
+    let root_id = tree.get_root_id();
+
+    let segments: Vec<&str> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if segments.is_empty() {
+        return Some(root_id);
+    }
+
+    let root = tree.get_instance(root_id)?;
+    let start = usize::from(segments[0] == root.name());
+
+    let mut current = root_id;
+    for segment in &segments[start..] {
+        let instance = tree.get_instance(current)?;
+        current = instance.children().iter().copied().find(|&child_id| {
+            tree.get_instance(child_id)
+                .is_some_and(|child| child.name() == *segment)
+        })?;
+    }
+
+    Some(current)
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -142,9 +272,26 @@ struct SourcemapArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReadInstanceArgs {
+    /// Slash-separated path to the instance from the project root, e.g.
+    /// "ReplicatedStorage/Shared/MyModule". Omit it (or pass "") for the root.
+    /// The root instance's own name may be included as the first segment.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct BuildArgs {
     /// Output file path. Must end in .rbxl, .rbxlx, .rbxm, or .rbxmx.
     output: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ResetStudioArgs {
+    /// Optional place file to open in Studio after relaunching, relative to the
+    /// project. Omit it to launch Studio to its start screen.
+    #[serde(default)]
+    place: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -159,6 +306,24 @@ struct GenScriptArgs {
     path: Option<String>,
 }
 
+/// A single instance's details, returned by the `read_instance` tool.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstanceView {
+    name: String,
+    class_name: String,
+    properties: serde_json::Map<String, serde_json::Value>,
+    children: Vec<ChildView>,
+}
+
+/// A child entry in an [`InstanceView`]: enough for the model to navigate to it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChildView {
+    name: String,
+    class_name: String,
+}
+
 #[tool_router]
 impl RojoMcpServer {
     #[tool(
@@ -167,11 +332,22 @@ impl RojoMcpServer {
                        navigating the project's structure."
     )]
     fn sourcemap(&self, Parameters(args): Parameters<SourcemapArgs>) -> Result<String, String> {
-        let mut rojo_args = vec!["sourcemap"];
-        if args.include_non_scripts {
-            rojo_args.push("--include-non-scripts");
-        }
-        self.run_rojo(&rojo_args)
+        super::sourcemap::sourcemap_json(&self.session, args.include_non_scripts)
+            .map_err(|err| err.to_string())
+    }
+
+    #[tool(
+        description = "Inspect one instance in the project tree: its class name, property \
+                       values, and the names and classes of its immediate children. Locate it \
+                       with a slash-separated path from the root (e.g. \
+                       \"ReplicatedStorage/Shared/MyModule\"); omit the path for the root. Run \
+                       `sourcemap` first to discover the names."
+    )]
+    fn read_instance(
+        &self,
+        Parameters(args): Parameters<ReadInstanceArgs>,
+    ) -> Result<String, String> {
+        self.read_instance_json(&args.path.unwrap_or_default())
     }
 
     #[tool(
@@ -189,6 +365,7 @@ impl RojoMcpServer {
     fn build(&self, Parameters(args): Parameters<BuildArgs>) -> Result<String, String> {
         self.ensure_writable()?;
         self.confine(&args.output)?;
+        require_build_extension(&args.output)?;
         self.run_rojo(&["build", "--json", "--output", &args.output])
     }
 
@@ -232,6 +409,28 @@ impl RojoMcpServer {
         self.ensure_writable()?;
         self.run_rojo(&["restart", "--json"])
     }
+
+    #[tool(
+        description = "Force-restart Roblox Studio with no native dialogs (macOS only): kills \
+                       Studio, deletes its auto-recovery files so no 'restore' prompt appears, \
+                       and relaunches it. Optionally open a place file (relative to the project). \
+                       Use this to reboot Studio unattended; the Rojo plugin reconnects to the \
+                       running server on its own."
+    )]
+    fn reset_studio(
+        &self,
+        Parameters(args): Parameters<ResetStudioArgs>,
+    ) -> Result<String, String> {
+        self.ensure_writable()?;
+
+        let mut rojo_args = vec!["studio", "reset", "--json"];
+        if let Some(place) = args.place.as_deref() {
+            self.confine(place)?;
+            rojo_args.push("--place");
+            rojo_args.push(place);
+        }
+        self.run_rojo(&rojo_args)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -241,13 +440,15 @@ impl ServerHandler for RojoMcpServer {
         info.server_info = Implementation::new("rojo", env!("CARGO_PKG_VERSION"));
 
         let tools = if self.read_only {
-            "sourcemap (instance tree), status"
+            "sourcemap (instance tree), read_instance, status"
         } else {
-            "sourcemap (instance tree), status, build, gen_script, stop, restart"
+            "sourcemap (instance tree), read_instance, status, build, gen_script, stop, restart, \
+             reset_studio"
         };
         let mode = if self.read_only { " (read-only)" } else { "" };
         info.instructions = Some(format!(
-            "Rojo MCP server{mode}. Tools: {tools}. Use sourcemap first to understand the project."
+            "Rojo MCP server{mode}. Tools: {tools}. Use sourcemap first to understand the \
+             project, then read_instance to inspect a specific instance's properties."
         ));
 
         info
@@ -274,5 +475,89 @@ fn run_rojo_command(work_dir: &Path, args: &[&str]) -> Result<String, String> {
             args.join(" "),
             stderr.trim()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a server backed by a live session for the `attributes` test
+    /// project (DataModel → Workspace → Folder, where Folder has an attribute).
+    /// Watching is disabled so the test only sees the deterministic initial tree.
+    fn attributes_server() -> RojoMcpServer {
+        let project = fs_err::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-projects")
+                .join("attributes"),
+        )
+        .unwrap();
+
+        let vfs = Vfs::new_default().unwrap();
+        vfs.set_watch_enabled(false);
+        let session = Arc::new(ServeSession::new(vfs, &project).unwrap());
+
+        RojoMcpServer::new(project, session, false)
+    }
+
+    #[test]
+    fn build_extension_accepts_roblox_formats() {
+        for output in ["game.rbxl", "game.rbxlx", "model.rbxm", "model.rbxmx"] {
+            assert!(
+                require_build_extension(output).is_ok(),
+                "{output} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn build_extension_is_case_insensitive() {
+        assert!(require_build_extension("Game.RBXL").is_ok());
+    }
+
+    #[test]
+    fn build_extension_rejects_other_formats() {
+        for output in ["out.txt", "game.rbx", "noextension", "archive.zip"] {
+            assert!(
+                require_build_extension(output).is_err(),
+                "{output} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sourcemap_reads_embedded_tree() {
+        let server = attributes_server();
+
+        let json =
+            super::super::sourcemap::sourcemap_json(&server.session, true).expect("sourcemap");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["name"], "attributes");
+    }
+
+    #[test]
+    fn read_instance_resolves_paths() {
+        let server = attributes_server();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&server.read_instance_json("").unwrap()).unwrap();
+        assert_eq!(root["name"], "attributes");
+
+        // The nested instance resolves with and without the optional root-name
+        // prefix.
+        for path in ["Workspace/Folder", "attributes/Workspace/Folder"] {
+            let folder: serde_json::Value =
+                serde_json::from_str(&server.read_instance_json(path).unwrap()).unwrap();
+            assert_eq!(folder["name"], "Folder", "for path {path}");
+            assert_eq!(folder["className"], "Folder", "for path {path}");
+        }
+    }
+
+    #[test]
+    fn read_instance_rejects_unknown_path() {
+        let server = attributes_server();
+
+        assert!(server.read_instance_json("Workspace/DoesNotExist").is_err());
     }
 }

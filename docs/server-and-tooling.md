@@ -9,6 +9,7 @@ Model Context Protocol (MCP) server.
 - [`rojo test`](#rojo-test)
 - [`rojo gen`](#rojo-gen)
 - [Machine-readable output (`--json`)](#machine-readable-output---json)
+- [Project hooks](#project-hooks)
 - [The MCP server (`rojo mcp`)](#the-mcp-server-rojo-mcp)
 - [The serve-state file](#the-serve-state-file)
 - [HTTP API additions](#http-api-additions)
@@ -118,6 +119,59 @@ current terminal instead.
 
 ---
 
+## Rebooting Studio unattended (`rojo studio reset`)
+
+**macOS only.** Rebooting Roblox Studio normally needs a human to click two
+native dialogs: **"Don't Save"** when closing with unsaved changes, and the
+auto-recovery **"restore"** prompt on the next launch. That stalls an agent
+driving a serve/test loop. `rojo studio reset` force-restarts Studio without
+either dialog:
+
+1. **Force-kills** Studio (`SIGKILL`) — a killed process can't raise the "Don't
+   Save" prompt.
+2. **Deletes the auto-recovery files** — with nothing to restore, the restore
+   prompt has nothing to offer. (There is no Studio setting that disables it, so
+   removing the files is the only reliable suppression.)
+3. **Relaunches** Studio. A connected Rojo plugin reconnects to the still-running
+   `rojo serve` on its own, because the [session id](#stable-session-id-across-restarts)
+   is preserved across the reboot.
+
+This is OS-level automation (Rojo's Luau plugin can't dismiss native dialogs, and
+the recovery prompt appears before any plugin even loads), which is why it is a
+separate, platform-specific command. On other platforms it exits with a clear
+"only supported on macOS" message.
+
+```
+rojo studio reset [PROJECT] [--place <FILE>] [--no-launch] [--no-clear-recovery]
+                  [--recovery-path <DIR>] [--restart-serve] [--json]
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--place <FILE>` | Open this place file after relaunching (otherwise Studio opens to its start screen). |
+| `--no-launch` | Kill and clear recovery, but don't relaunch. |
+| `--no-clear-recovery` | Leave the auto-recovery files in place (the restore prompt may then reappear). |
+| `--recovery-path <DIR>` | Override the auto-recovery directory (see below). |
+| `--restart-serve` | Also restart the project's `rojo serve` (best-effort), for a full reset of the connection. `PROJECT` selects which server. |
+
+```json
+{ "killed": true, "recoveryClearedCount": 2, "serveRestarted": false, "relaunched": true }
+```
+
+> **Clearing recovery is destructive by design.** It deletes Studio's
+> auto-recovery backups so the prompt can't appear — intended for a test loop
+> where Rojo's source files are the source of truth, not Studio. Use
+> `--no-clear-recovery` to keep them.
+
+**Recovery path & process name.** The default recovery directory is Studio's
+macOS AutoSaves folder,
+`~/Library/Application Support/Roblox/RobloxStudio/AutoSaves`, and Studio is
+matched by the process name `RobloxStudio`. Both can change across Studio
+versions; if the restore prompt still appears, find the real directory (look for
+recently-modified files there after a crash) and pass it with `--recovery-path`.
+
+---
+
 ## `rojo test`
 
 Runs a project's Luau tests with a pluggable runner. Rojo does not ship a Luau
@@ -200,12 +254,70 @@ rojo status --json
 
 ---
 
+## Project hooks
+
+Hooks are commands Rojo runs at build and serve milestones, declared in the
+project file. They're for automation and CI: code generation, asset processing,
+linting, or notifications.
+
+```jsonc
+{
+  "name": "my-game",
+  "tree": { "$path": "src" },
+  "hooks": {
+    // Run before `rojo build` writes its output.
+    "preBuild": ["wally install"],
+    // Run after a successful `rojo build`.
+    "postBuild": [
+      "echo done",                       // a shell command line, or
+      ["cp", "game.rbxl", "dist/game.rbxl"]  // an explicit program + args
+    ],
+    // Run once `rojo serve` has bound its port.
+    "serve": ["echo serving"]
+  }
+}
+```
+
+Each event takes a list of commands run in order. A command is either a **string**
+(run through the platform shell — `sh -c` on Unix, `cmd /C` on Windows, so pipes
+and `&&` work) or an **array** of strings (a program and its arguments, run
+directly without a shell to avoid quoting concerns). Commands run with the project
+directory as their working directory.
+
+- A failing `preBuild`/`postBuild` command fails the build (non-zero exit).
+- A failing `serve` command is logged but does **not** stop an already-running
+  server.
+- In `rojo build --watch`, hooks run for the initial build only, not on each
+  rebuild — so a hook that writes into the project can't cause a rebuild loop.
+- With `--json`, hook output is routed to stderr so stdout stays parseable.
+
+### Trust model
+
+Hooks are arbitrary commands that run with your privileges, exactly like a
+`Makefile` target or an npm `postinstall` script. **Only run hooks for projects
+you trust.** The global `--no-hooks` flag disables all hooks for a single
+invocation, which is the safe choice when building or serving a project from an
+untrusted source:
+
+```bash
+rojo build --no-hooks -o game.rbxl
+```
+
+---
+
 ## The MCP server (`rojo mcp`)
 
 `rojo mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
 server over stdio, exposing Rojo's tooling to MCP clients (AI assistants and
-editors). It is a thin wrapper that drives Rojo's own CLI, so its tools behave
-exactly like the commands above.
+editors).
+
+The read tools an assistant calls repeatedly while exploring a project
+(`sourcemap`, `read_instance`) are answered from a single long-lived,
+file-watching session held in memory, so they don't rebuild the instance tree on
+every call and they reflect edits as soon as the file watcher picks them up. The
+remaining tools (`build`, `gen_script`, the `status`/`stop`/`restart` server
+controls, and `reset_studio`) drive Rojo's own CLI, so they behave exactly like
+the commands above and `build` always reads fresh from disk.
 
 It is **opt-in at build time** because its dependencies require a newer Rust
 toolchain than Rojo's minimum supported version:
@@ -225,23 +337,25 @@ rojo mcp [PROJECT] [--read-only]
 | Tool | Mutating | Description |
 | --- | --- | --- |
 | `sourcemap` | no | The project's instance tree (best for navigation). |
+| `read_instance` | no | One instance's class, property values, and immediate children, located by a slash-separated path from the root (e.g. `ReplicatedStorage/Shared/MyModule`). |
 | `status` | no | Whether a server is running, and its details. |
 | `build` | yes | Build the project to a `.rbxl`/`.rbxlx`/`.rbxm`/`.rbxmx` file. |
 | `gen_script` | yes | Scaffold a server/client/module script. |
 | `stop` | yes | Stop the running server. |
 | `restart` | yes | Restart the running server. |
+| `reset_studio` | yes | Force-restart Roblox Studio with no native dialogs (macOS only); optionally open a place. See [`rojo studio reset`](#rebooting-studio-unattended-rojo-studio-reset). |
 
 ### Read-only mode
 
-`--read-only` exposes only the non-mutating tools (`sourcemap`, `status`); the
-mutating tools are hidden and rejected. This is the safe default for untrusted
-sessions.
+`--read-only` exposes only the non-mutating tools (`sourcemap`, `read_instance`,
+`status`); the mutating tools are hidden and rejected. This is the safe default
+for untrusted sessions.
 
 ### Safety
 
-Tool file paths (`build` output, `gen_script` path) are confined to the project
-directory — absolute paths and `..` are rejected. Tool failures are reported as
-MCP errors rather than silently succeeding.
+Tool file paths (`build` output, `gen_script` path, `reset_studio` place) are
+confined to the project directory — absolute paths and `..` are rejected. Tool
+failures are reported as MCP errors rather than silently succeeding.
 
 ### Registering with a client
 
@@ -276,4 +390,4 @@ MessagePack by default, or JSON when the request sends `Accept: application/json
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/health`, `/api/status` | Session id, server/protocol version, project name, uptime, connected-client count. |
-| `POST` | `/api/stop` | Gracefully shut down the server. Local-only and guarded by the current session id. |
+| `POST` | `/api/stop` | Gracefully shut down the server. Local-only; guarded by the current session id, and by the process id too when the caller provides one (so a stop aimed at a restarted server's predecessor can't hit its successor). |

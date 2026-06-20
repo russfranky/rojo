@@ -107,11 +107,43 @@ fn stop_rejects_wrong_session_id() {
 }
 
 #[test]
+fn stop_rejects_wrong_pid() {
+    run_serve_test("empty", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+
+        // Correct session id, but a pid that isn't this server's. Because
+        // `rojo restart` reuses the session id, the pid is what keeps a stop
+        // aimed at a predecessor from killing its successor, so a mismatch must
+        // be refused.
+        let wrong_pid = session.pid().wrapping_add(1);
+        let response = session.post_api_stop_with_pid(info.session_id, wrong_pid);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The server should still be running after a rejected stop.
+        assert!(session.get_api_rojo().is_ok());
+    });
+}
+
+#[test]
 fn stop_shuts_down_server() {
     run_serve_test("empty", |session, _redactions| {
         let info = session.get_api_rojo().unwrap();
 
         let response = session.post_api_stop(info.session_id);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        session.wait_until_offline();
+    });
+}
+
+#[test]
+fn stop_shuts_down_server_with_matching_pid() {
+    run_serve_test("empty", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+
+        // Correct session id and the server's real pid: the authoritative stop
+        // the CLI sends. It should shut the server down.
+        let response = session.post_api_stop_with_pid(info.session_id, session.pid());
         assert_eq!(response.status(), StatusCode::OK);
 
         session.wait_until_offline();

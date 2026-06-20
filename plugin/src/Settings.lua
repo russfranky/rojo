@@ -13,6 +13,15 @@ local defaultSettings = {
 	openScriptsExternally = false,
 	twoWaySync = false,
 	autoReconnect = false,
+	-- Automatically reconnect a live session when the connection drops (e.g. the
+	-- server restarting or a transient network blip), using exponential backoff.
+	instantReconnect = true,
+	-- Maximum number of automatic reconnect attempts before giving up and falling
+	-- back to slower discovery polling. 0 means unlimited.
+	instantReconnectMaxAttempts = 8,
+	-- Base delay, in seconds, for the first reconnect attempt. Each subsequent
+	-- attempt doubles this delay (capped at 30 seconds).
+	instantReconnectBaseDelay = 1,
 	showNotifications = true,
 	enableSyncFallback = true,
 	syncReminderMode = "Notify" :: "None" | "Notify" | "Fullscreen",

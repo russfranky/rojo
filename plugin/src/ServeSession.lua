@@ -55,6 +55,29 @@ local function attemptReparent(instance, parent)
 	end)
 end
 
+-- Errors that mean the server is reachable but fundamentally incompatible or
+-- mismatched, so automatically reconnecting would just loop. Transient errors
+-- (the socket dropping, the server being briefly unreachable during a restart)
+-- are everything else and are safe to retry.
+local function isFatalError(err)
+	local message = tostring(err)
+	local fatalSignatures = {
+		"protocol version",
+		"specific list of places",
+		"hosts a different project",
+		"Cannot sync a model as a place",
+		"Aborted Rojo sync",
+	}
+
+	for _, signature in fatalSignatures do
+		if string.find(message, signature, 1, true) ~= nil then
+			return true
+		end
+	end
+
+	return false
+end
+
 local ServeSession = {}
 ServeSession.__index = ServeSession
 
@@ -109,6 +132,13 @@ function ServeSession.new(options)
 		__precommitCallbacks = {},
 		__postcommitCallbacks = {},
 		__updateLoadingText = function() end,
+		-- The name of the project we connected to, set once we first reach
+		-- Status.Connected. Used to guard reconnects against a different project
+		-- now serving on the same address.
+		__projectName = nil,
+		-- State for the automatic reconnect loop (see __scheduleReconnect).
+		__reconnectAttempt = 0,
+		__reconnectThread = nil,
 	}
 
 	setmetatable(self, ServeSession)
@@ -190,15 +220,46 @@ function ServeSession:hookPostcommit(callback)
 end
 
 function ServeSession:start()
+	self.__reconnectAttempt = 0
 	self:__setStatus(Status.Connecting)
 	self:setLoadingText("Connecting to server...")
+	self:__attemptConnection()
+end
 
+-- Performs a single connect -> initial sync -> live socket attempt. On an
+-- unexpected failure it either schedules an automatic reconnect or stops,
+-- depending on whether the failure is transient. This is invoked both for the
+-- first connection and for each reconnect attempt.
+function ServeSession:__attemptConnection()
 	self.__apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			-- The session may have been stopped while the request was in flight.
+			if self.__status == Status.Disconnected then
+				return Promise.reject("Session stopped")
+			end
+
+			-- If a different project is now being served on this address (for
+			-- example the user restarted `rojo serve` pointed at another project
+			-- on the same port), don't silently sync the wrong tree.
+			if self.__projectName ~= nil and serverInfo.projectName ~= self.__projectName then
+				return Promise.reject(
+					string.format(
+						"Server now hosts a different project ('%s', expected '%s'); not reconnecting.",
+						tostring(serverInfo.projectName),
+						tostring(self.__projectName)
+					)
+				)
+			end
+
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
 				self:setLoadingText("Starting sync loop...")
+				-- A successful sync re-bases the message cursor (see
+				-- __initialSync), so reconnecting after a server restart whose
+				-- message history reset to zero is handled transparently here.
+				self.__projectName = serverInfo.projectName
+				self.__reconnectAttempt = 0
 				self:__setStatus(Status.Connected, serverInfo.projectName)
 				self:__applyGameAndPlaceId(serverInfo)
 
@@ -219,10 +280,74 @@ function ServeSession:start()
 			end)
 		end)
 		:catch(function(err)
-			if self.__status ~= Status.Disconnected then
+			-- A clean, user-initiated disconnect already set this status; nothing
+			-- more to do.
+			if self.__status == Status.Disconnected then
+				return
+			end
+
+			if self:__shouldReconnect(err) then
+				self:__scheduleReconnect(err)
+			else
 				self:__stopInternal(err)
 			end
 		end)
+end
+
+-- Whether a failed (re)connection attempt should be retried automatically.
+function ServeSession:__shouldReconnect(err)
+	if not Settings:get("instantReconnect") then
+		return false
+	end
+
+	-- Only auto-reconnect once we've successfully connected at least once, so a
+	-- failed *initial* connect surfaces to the user normally instead of looping.
+	if self.__projectName == nil then
+		return false
+	end
+
+	return not isFatalError(err)
+end
+
+-- Schedules the next reconnect attempt using exponential backoff with jitter,
+-- capped at 30 seconds. Falls back to a full stop once the attempt limit is hit,
+-- letting the app's slower discovery polling take over.
+function ServeSession:__scheduleReconnect(err)
+	self.__reconnectAttempt += 1
+
+	local maxAttempts = Settings:get("instantReconnectMaxAttempts")
+	if maxAttempts > 0 and self.__reconnectAttempt > maxAttempts then
+		Log.warn("Giving up automatic reconnect after {} attempts", maxAttempts)
+		self:__stopInternal(err)
+		return
+	end
+
+	local baseDelay = Settings:get("instantReconnectBaseDelay")
+	local delay = math.min(baseDelay * 2 ^ (self.__reconnectAttempt - 1), 30)
+	-- Add jitter (+/-15%) to avoid synchronized reconnect storms.
+	delay *= 0.85 + math.random() * 0.3
+
+	-- Reflect the transient state in the UI, but only re-fire the status change
+	-- when leaving Connected so we don't spam a notification on every attempt.
+	if self.__status ~= Status.Connecting then
+		self:__setStatus(Status.Connecting)
+	end
+	self:setLoadingText(string.format("Reconnecting to server (attempt %d)...", self.__reconnectAttempt))
+
+	Log.warn(
+		"Lost connection to Rojo server: {}. Reconnecting in {}s (attempt {}).",
+		tostring(err),
+		string.format("%.1f", delay),
+		self.__reconnectAttempt
+	)
+
+	self.__reconnectThread = task.delay(delay, function()
+		self.__reconnectThread = nil
+		if self.__status == Status.Disconnected then
+			return
+		end
+		self:__attemptConnection()
+	end)
 end
 
 function ServeSession:stop()
@@ -570,6 +695,13 @@ end
 
 function ServeSession:__stopInternal(err)
 	self:__setStatus(Status.Disconnected, err)
+
+	-- Cancel any pending automatic reconnect so a stopped session stays stopped.
+	if self.__reconnectThread then
+		task.cancel(self.__reconnectThread)
+		self.__reconnectThread = nil
+	end
+
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()

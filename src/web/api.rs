@@ -17,12 +17,13 @@ use crate::{
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
         interface::{
-            ErrorResponse, Instance, MessagesPacket, OpenResponse, ReadResponse,
-            ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType, SubscribeMessage,
-            WriteRequest, WriteResponse, PROTOCOL_VERSION, SERVER_VERSION,
+            ErrorResponse, HealthResponse, Instance, MessagesPacket, OpenResponse, ReadResponse,
+            ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType, StopRequest,
+            StopResponse, SubscribeMessage, WriteRequest, WriteResponse, PROTOCOL_VERSION,
+            SERVER_VERSION,
         },
         origin::canonical,
-        util::{deserialize_msgpack, msgpack, msgpack_ok, serialize_msgpack},
+        util::{deserialize_msgpack, json, msgpack, msgpack_ok, serialize_msgpack},
     },
     web_api::{
         InstanceUpdate, RefPatchRequest, RefPatchResponse, SerializeRequest, SerializeResponse,
@@ -38,6 +39,10 @@ pub async fn call(
 
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/api/rojo") => service.handle_api_rojo().await,
+        (&Method::GET, "/api/health") | (&Method::GET, "/api/status") => {
+            service.handle_api_health(&request).await
+        }
+        (&Method::POST, "/api/stop") => service.handle_api_stop(request).await,
         (&Method::GET, path) if path.starts_with("/api/read/") => {
             service.handle_api_read(request).await
         }
@@ -97,6 +102,66 @@ impl ApiService {
             game_id: self.serve_session.game_id(),
             root_instance_id,
         })
+    }
+
+    /// Lightweight liveness/identity probe. Returns the session id, versions,
+    /// uptime, and connected-client count.
+    ///
+    /// Responds with JSON when the request's `Accept` header asks for it (used by
+    /// the CLI), otherwise msgpack (used by the Studio plugin).
+    async fn handle_api_health(&self, request: &Request<Body>) -> Response<Body> {
+        let health = HealthResponse {
+            session_id: self.serve_session.session_id(),
+            server_version: SERVER_VERSION.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            project_name: self.serve_session.project_name().to_owned(),
+            uptime_seconds: self.serve_session.uptime().as_secs(),
+            connected_clients: self.serve_session.connected_clients() as u64,
+        };
+
+        negotiate(accepts_json(request), health, StatusCode::OK)
+    }
+
+    /// Requests a graceful shutdown of the server. Local-only and guarded by the
+    /// session id, so only a local client that knows the current session can stop
+    /// the server. Used by `rojo stop`/`rojo restart`.
+    async fn handle_api_stop(&self, request: Request<Body>) -> Response<Body> {
+        // Stopping the server is a local control action, so it must never be
+        // reachable by a remote client even when bound to an exposed address.
+        // Same locality reasoning as `/api/open`.
+        if !canonical(self.remote_addr.ip()).is_loopback() {
+            return msgpack(
+                ErrorResponse::forbidden("/api/stop is only available to local clients"),
+                StatusCode::FORBIDDEN,
+            );
+        }
+
+        let accepts_json = accepts_json(&request);
+        let body = body::to_bytes(request.into_body()).await.unwrap();
+
+        let stop_request: StopRequest = match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(err) => {
+                return negotiate(
+                    accepts_json,
+                    ErrorResponse::bad_request(format!("Invalid body: {}", err)),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+
+        let session_id = self.serve_session.session_id();
+        if stop_request.session_id != session_id {
+            return negotiate(
+                accepts_json,
+                ErrorResponse::bad_request("Wrong session ID"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+
+        self.serve_session.request_shutdown();
+
+        negotiate(accepts_json, StopResponse { session_id }, StatusCode::OK)
     }
 
     /// Handle WebSocket upgrade for real-time message streaming
@@ -493,6 +558,10 @@ async fn handle_websocket_subscription(
 ) -> anyhow::Result<()> {
     let mut websocket = websocket.await?;
 
+    // Count this client for the lifetime of the subscription. The guard
+    // decrements the session's connected-client count on every exit path below.
+    let _client_guard = serve_session.track_connected_client();
+
     let session_id = serve_session.session_id();
     let tree_handle = serve_session.tree_handle();
     let message_queue = serve_session.message_queue();
@@ -590,6 +659,30 @@ async fn handle_websocket_subscription(
     }
 
     Ok(())
+}
+
+/// Whether the request's `Accept` header asks for JSON. Used to serve JSON to
+/// the CLI while continuing to serve msgpack to the Studio plugin by default.
+fn accepts_json(request: &Request<Body>) -> bool {
+    request
+        .headers()
+        .get(hyper::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.contains("application/json"))
+        .unwrap_or(false)
+}
+
+/// Serializes `value` as JSON or msgpack depending on `accepts_json`.
+fn negotiate<T: serde::Serialize>(
+    accepts_json: bool,
+    value: T,
+    code: StatusCode,
+) -> Response<Body> {
+    if accepts_json {
+        json(value, code)
+    } else {
+        msgpack(value, code)
+    }
 }
 
 /// Certain Instances MUST be a child of specific classes. This function

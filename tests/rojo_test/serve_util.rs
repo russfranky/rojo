@@ -15,8 +15,8 @@ use tempfile::{tempdir, TempDir};
 
 use librojo::{
     web_api::{
-        ReadResponse, SerializeRequest, SerializeResponse, ServerInfoResponse, SocketPacket,
-        SocketPacketType,
+        HealthResponse, ReadResponse, SerializeRequest, SerializeResponse, ServerInfoResponse,
+        SocketPacket, SocketPacketType, StopRequest,
     },
     SessionId,
 };
@@ -176,6 +176,69 @@ impl TestServeSession {
         let body = reqwest::blocking::get(url)?.bytes()?;
 
         Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
+    }
+
+    pub fn get_api_health(&self) -> Result<HealthResponse, reqwest::Error> {
+        let url = format!("http://localhost:{}/api/health", self.port);
+        let body = reqwest::blocking::get(url)?.bytes()?;
+
+        Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
+    }
+
+    /// Sends a POST to `/api/stop` with the given session id (as JSON, like the
+    /// CLI does) and returns the response.
+    pub fn post_api_stop(&self, session_id: SessionId) -> reqwest::blocking::Response {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://localhost:{}/api/stop", self.port);
+        let body = serde_json::to_vec(&StopRequest { session_id }).unwrap();
+
+        client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .body(body)
+            .send()
+            .expect("Failed to send request")
+    }
+
+    /// Kills the running server and starts a fresh one for the same project
+    /// directory, returning the new server's info. A new port is used to avoid
+    /// racing on the just-released one; the session id is keyed on the project's
+    /// serve-state file rather than the port, so it should be reused.
+    pub fn restart(&mut self) -> ServerInfoResponse {
+        let _ = self.rojo_process.0.kill();
+        let _ = self.rojo_process.0.wait();
+
+        let working_dir = get_working_dir_path();
+        let port = get_port_number();
+        self.port = port;
+        let port_string = port.to_string();
+
+        let rojo_process = Command::new(ROJO_PATH)
+            .args([
+                "serve",
+                self.project_path.to_str().unwrap(),
+                "--port",
+                port_string.as_str(),
+            ])
+            .current_dir(working_dir)
+            .spawn()
+            .expect("Couldn't restart Rojo");
+        self.rojo_process = KillOnDrop(rojo_process);
+
+        self.wait_to_come_online()
+    }
+
+    /// Polls until the server stops responding, panicking if it stays up.
+    pub fn wait_until_offline(&self) {
+        for _ in 0..50 {
+            if self.get_api_rojo().is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        panic!("Server did not shut down after a stop request");
     }
 
     pub fn get_api_socket_packet(

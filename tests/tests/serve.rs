@@ -10,7 +10,10 @@ use crate::rojo_test::{
     serve_util::{deserialize_msgpack, run_serve_test, serialize_to_xml_model},
 };
 
-use librojo::web_api::{SerializeResponse, SocketPacketType};
+use librojo::{
+    web_api::{SerializeResponse, SocketPacketType},
+    SessionId,
+};
 
 #[test]
 fn rejects_dns_rebinding_requests() {
@@ -64,6 +67,55 @@ fn assert_rejected(response: reqwest::blocking::Response) {
         !body_lower.contains("rojo") && !body_lower.contains("rebinding"),
         "rejection body should not identify the server, got {body:?}",
     );
+}
+
+#[test]
+fn health_endpoint() {
+    run_serve_test("empty", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+        let health = session.get_api_health().unwrap();
+
+        assert_eq!(health.session_id, info.session_id);
+        assert_eq!(health.project_name, info.project_name);
+        assert_eq!(health.protocol_version, info.protocol_version);
+        assert_eq!(health.connected_clients, 0);
+    });
+}
+
+#[test]
+fn session_id_stable_across_restart() {
+    run_serve_test("empty", |mut session, _redactions| {
+        let before = session.get_api_rojo().unwrap();
+        let after = session.restart();
+
+        assert_eq!(
+            before.session_id, after.session_id,
+            "session id should be reused across a server restart so clients reconnect seamlessly",
+        );
+    });
+}
+
+#[test]
+fn stop_rejects_wrong_session_id() {
+    run_serve_test("empty", |session, _redactions| {
+        let response = session.post_api_stop(SessionId::new());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The server should still be running after a rejected stop.
+        assert!(session.get_api_rojo().is_ok());
+    });
+}
+
+#[test]
+fn stop_shuts_down_server() {
+    run_serve_test("empty", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+
+        let response = session.post_api_stop(info.session_id);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        session.wait_until_offline();
+    });
 }
 
 #[test]

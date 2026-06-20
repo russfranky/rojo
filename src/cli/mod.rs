@@ -4,8 +4,10 @@ mod build;
 mod doc;
 mod fmt_project;
 mod init;
+mod output;
 mod plugin;
 mod serve;
+mod serve_control;
 mod sourcemap;
 mod syncback;
 mod upload;
@@ -43,9 +45,9 @@ impl Options {
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
-            Subcommand::Build(subcommand) => subcommand.run(),
+            Subcommand::Build(subcommand) => subcommand.run(self.global),
             Subcommand::Upload(subcommand) => subcommand.run(),
-            Subcommand::Sourcemap(subcommand) => subcommand.run(),
+            Subcommand::Sourcemap(subcommand) => subcommand.run(self.global),
             Subcommand::FmtProject(subcommand) => subcommand.run(),
             Subcommand::Doc(subcommand) => subcommand.run(),
             Subcommand::Plugin(subcommand) => subcommand.run(),
@@ -63,6 +65,24 @@ pub struct GlobalOptions {
     /// Set color behavior. Valid values are auto, always, and never.
     #[clap(long("color"), global(true), default_value("auto"))]
     pub color: ColorChoice,
+
+    /// Emit machine-readable JSON on stdout instead of human-readable text.
+    ///
+    /// When set, progress and diagnostic messages are routed to stderr so that
+    /// stdout contains only the command's JSON result. Useful for scripting and
+    /// AI tooling.
+    #[clap(long, global(true))]
+    pub json: bool,
+}
+
+impl Default for GlobalOptions {
+    fn default() -> Self {
+        GlobalOptions {
+            verbosity: 0,
+            color: ColorChoice::Auto,
+            json: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -7,13 +7,19 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::{session_id::SessionId, web_api::HealthResponse};
+use crate::{
+    session_id::SessionId,
+    state_file::{self, ServeState},
+    web_api::HealthResponse,
+};
 
 /// Default timeout for a liveness probe. Short, because a live local server
 /// answers almost instantly and we don't want to stall startup on a dead one.
@@ -92,4 +98,48 @@ pub fn request_stop(address: IpAddr, port: u16, session_id: SessionId) -> anyhow
     }
 
     Ok(())
+}
+
+/// Loads the serve-state for `root_dir` and probes it, returning both only if a
+/// matching server is actually running. A stale state file (server gone, or a
+/// different server now on that port) yields `None`.
+pub fn discover_running(root_dir: &Path) -> Option<(ServeState, HealthResponse)> {
+    let state = state_file::load(root_dir)?;
+    let health = probe(state.address, state.port)?;
+
+    if health.session_id != state.session_id {
+        return None;
+    }
+
+    Some((state, health))
+}
+
+/// Polls until the server at `address:port` stops responding, up to `timeout`.
+/// Returns whether it went offline in time.
+pub fn wait_until_offline(address: IpAddr, port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        if probe(address, port).is_none() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    false
+}
+
+/// Polls until the server at `address:port` starts responding, up to `timeout`.
+/// Returns whether it came online in time.
+pub fn wait_until_online(address: IpAddr, port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        if probe(address, port).is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    false
 }

@@ -104,7 +104,13 @@ impl SourcemapCommand {
             .ok();
 
         log::trace!("Writing initial sourcemap");
-        write_sourcemap(&session, self.output.as_deref(), filter, self.absolute, &global)?;
+        write_sourcemap(
+            &session,
+            self.output.as_deref(),
+            filter,
+            self.absolute,
+            &global,
+        )?;
 
         if self.watch {
             log::trace!("Setting up runtime for watch mode");
@@ -121,7 +127,13 @@ impl SourcemapCommand {
                 cursor = new_cursor;
 
                 if patch_set_affects_sourcemap(&session, &patch_set, filter) {
-                    write_sourcemap(&session, self.output.as_deref(), filter, self.absolute, &global)?;
+                    write_sourcemap(
+                        &session,
+                        self.output.as_deref(),
+                        filter,
+                        self.absolute,
+                        &global,
+                    )?;
                 }
             }
         }

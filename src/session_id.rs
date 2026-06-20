@@ -1,7 +1,7 @@
 // Default doesn't make sense for a type whose constructor is random.
 #![allow(clippy::new_without_default)]
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,5 +22,13 @@ impl SessionId {
 impl fmt::Display for SessionId {
     fn fmt(&self, writer: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(writer, "{}", self.0)
+    }
+}
+
+impl FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        Ok(SessionId(Uuid::parse_str(source)?))
     }
 }

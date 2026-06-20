@@ -257,7 +257,10 @@ impl ServeSession {
     /// Uses `notify_one`, which stores a permit if the server is not yet
     /// awaiting, so a shutdown request can never be lost to a race.
     pub fn request_shutdown(&self) {
-        log::debug!("Graceful shutdown requested for session {}", self.session_id);
+        log::debug!(
+            "Graceful shutdown requested for session {}",
+            self.session_id
+        );
         self.shutdown.notify_one();
     }
 

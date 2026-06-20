@@ -3,13 +3,18 @@
 mod build;
 mod doc;
 mod fmt_project;
+mod gen;
 mod init;
 mod output;
 mod plugin;
+mod restart;
 mod serve;
 mod serve_control;
 mod sourcemap;
+mod status;
+mod stop;
 mod syncback;
+mod test;
 mod upload;
 
 use std::{borrow::Cow, env, path::Path, str::FromStr};
@@ -21,11 +26,16 @@ use thiserror::Error;
 pub use self::build::BuildCommand;
 pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
+pub use self::gen::GenCommand;
 pub use self::init::{InitCommand, InitKind};
 pub use self::plugin::{PluginCommand, PluginSubcommand};
+pub use self::restart::RestartCommand;
 pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
+pub use self::status::StatusCommand;
+pub use self::stop::StopCommand;
 pub use self::syncback::SyncbackCommand;
+pub use self::test::TestCommand;
 pub use self::upload::UploadCommand;
 
 /// Command line options that Rojo accepts, defined using the clap crate.
@@ -52,6 +62,11 @@ impl Options {
             Subcommand::Doc(subcommand) => subcommand.run(),
             Subcommand::Plugin(subcommand) => subcommand.run(),
             Subcommand::Syncback(subcommand) => subcommand.run(self.global),
+            Subcommand::Status(subcommand) => subcommand.run(self.global),
+            Subcommand::Stop(subcommand) => subcommand.run(self.global),
+            Subcommand::Restart(subcommand) => subcommand.run(self.global),
+            Subcommand::Test(subcommand) => subcommand.run(self.global),
+            Subcommand::Gen(subcommand) => subcommand.run(self.global),
         }
     }
 }
@@ -144,6 +159,11 @@ pub enum Subcommand {
     Doc(DocCommand),
     Plugin(PluginCommand),
     Syncback(SyncbackCommand),
+    Status(StatusCommand),
+    Stop(StopCommand),
+    Restart(RestartCommand),
+    Test(TestCommand),
+    Gen(GenCommand),
 }
 
 pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
@@ -155,5 +175,23 @@ pub(super) fn resolve_path(path: &Path) -> anyhow::Result<Cow<'_, Path>> {
              It may have been deleted, or Rojo may not have permission to access it.",
         )?;
         Ok(Cow::Owned(current_dir.join(path)))
+    }
+}
+
+/// Resolves the project root directory (where Rojo keeps its `.rojo/` state) for
+/// a project path argument. A path to a `.project.json` file resolves to its
+/// parent directory; a directory resolves to itself. This mirrors how
+/// `rojo serve` derives its root, so `status`/`stop`/`restart` find the same
+/// state file.
+pub(super) fn resolve_project_root(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let path = resolve_path(path)?;
+
+    if path.is_file() {
+        Ok(path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf()))
+    } else {
+        Ok(path.to_path_buf())
     }
 }

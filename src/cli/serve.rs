@@ -45,6 +45,12 @@ pub struct ServeCommand {
     /// validation for binds where it is otherwise off (such as `0.0.0.0`).
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Force a specific session id instead of generating or reusing one. Mainly
+    /// used internally by `rojo restart` to preserve the session across a
+    /// restart so connected clients reconnect without interruption.
+    #[clap(long, hide = true)]
+    pub session_id: Option<SessionId>,
 }
 
 impl ServeCommand {
@@ -63,8 +69,9 @@ impl ServeCommand {
 
         // Reuse the session id from a prior serve session (if one exited without
         // cleaning up) so connected plugins reconnect seamlessly across a
-        // restart. Bails if a server is genuinely still running.
-        let session_id = resolve_session_id(&root_dir)?;
+        // restart. Bails if a server is genuinely still running. An explicit
+        // --session-id (e.g. from `rojo restart`) takes precedence.
+        let session_id = resolve_session_id(&root_dir, self.session_id)?;
 
         let session = Arc::new(ServeSession::new_with_session_id(
             vfs,
@@ -133,31 +140,43 @@ impl ServeCommand {
 
 /// Decides which [`SessionId`] a starting server should use.
 ///
-/// Returns the id recorded by a previous serve session for this project so a
-/// connected plugin reconnects seamlessly, unless that previous server is still
-/// running (in which case it bails). Returns `None` to mint a fresh id when
-/// there is no usable prior state.
-fn resolve_session_id(root_dir: &Path) -> anyhow::Result<Option<SessionId>> {
-    let Some(prior) = state_file::load(root_dir) else {
-        return Ok(None);
-    };
+/// Bails if a server is already running for this project. Otherwise prefers an
+/// explicit override (from `rojo restart`), then the id recorded by a previous
+/// serve session (so a connected plugin reconnects seamlessly), and finally
+/// `None` to mint a fresh id.
+fn resolve_session_id(
+    root_dir: &Path,
+    explicit: Option<SessionId>,
+) -> anyhow::Result<Option<SessionId>> {
+    let prior = state_file::load(root_dir);
 
-    match serve_control::probe(prior.address, prior.port) {
-        Some(health) if health.session_id == prior.session_id => anyhow::bail!(
-            "A Rojo server for this project is already running at {}:{} (pid {}).\n\
-             Use `rojo restart` to restart it, or `rojo stop` to stop it first.",
-            prior.address,
-            prior.port,
-            prior.pid
-        ),
-        _ => {
-            log::debug!(
-                "Reusing session id {} from a previous serve session",
-                prior.session_id
-            );
-            Ok(Some(prior.session_id))
+    if let Some(prior) = &prior {
+        if let Some(health) = serve_control::probe(prior.address, prior.port) {
+            if health.session_id == prior.session_id {
+                anyhow::bail!(
+                    "A Rojo server for this project is already running at {}:{} (pid {}).\n\
+                     Use `rojo restart` to restart it, or `rojo stop` to stop it first.",
+                    prior.address,
+                    prior.port,
+                    prior.pid
+                );
+            }
         }
     }
+
+    if let Some(explicit) = explicit {
+        return Ok(Some(explicit));
+    }
+
+    if let Some(prior) = prior {
+        log::debug!(
+            "Reusing session id {} from a previous serve session",
+            prior.session_id
+        );
+        return Ok(Some(prior.session_id));
+    }
+
+    Ok(None)
 }
 
 fn show_start_message(bind_address: IpAddr, port: u16, color: ColorChoice) -> io::Result<()> {

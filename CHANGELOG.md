@@ -37,7 +37,7 @@ Making a new release? Simply add the new header with the version and date undern
 * Added `rojo gen script` to scaffold new server/client/module scripts from templates.
 * Added a global `--json` flag for machine-readable output on `build`, `sourcemap`, `status`, `stop`, `restart`, `test`, and `gen`.
 * Added an optional `rojo mcp` Model Context Protocol server (build with `--features mcp`) that exposes Rojo's tooling to AI assistants over stdio, including a `--read-only` inspector mode.
-* Added `rojo studio reset` (macOS) and a matching `reset_studio` MCP tool to force-restart Roblox Studio without the "Don't Save" or auto-recovery dialogs, so Studio can be rebooted unattended during a serve/test loop.
+* Added `rojo studio reset` (macOS) and a matching `reset_studio` MCP tool to force-restart Roblox Studio without the "Don't Save", macOS "quit unexpectedly", or auto-recovery dialogs, so Studio can be rebooted unattended during a serve/test loop.
 * `inf` and `nan` values in properties are now synced ([#1176])
 * Fixed a bug caused by having reference properties (such as `ObjectValue.Value`) that point to an Instance not included in syncback. ([#1179])
 * Fixed instance replacement fallback failing when too many instances needed to be replaced. ([#1192])

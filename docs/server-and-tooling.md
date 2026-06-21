@@ -121,18 +121,23 @@ current terminal instead.
 
 ## Rebooting Studio unattended (`rojo studio reset`)
 
-**macOS only.** Rebooting Roblox Studio normally needs a human to click two
-native dialogs: **"Don't Save"** when closing with unsaved changes, and the
-auto-recovery **"restore"** prompt on the next launch. That stalls an agent
-driving a serve/test loop. `rojo studio reset` force-restarts Studio without
-either dialog:
+**macOS only.** Rebooting Roblox Studio normally needs a human to click through
+up to three native dialogs: **"Don't Save"** when closing with unsaved changes,
+the macOS **"RobloxStudio quit unexpectedly"** crash dialog after a force-kill,
+and the auto-recovery **"restore"** prompt on the next launch. That stalls an
+agent driving a serve/test loop. `rojo studio reset` force-restarts Studio
+without any of them:
 
-1. **Force-kills** Studio (`SIGKILL`) — a killed process can't raise the "Don't
+1. **Silences the macOS crash reporter** for the reboot
+   (`defaults write com.apple.CrashReporter DialogType none`). A force-killed app
+   exits abnormally, which otherwise raises the system "quit unexpectedly"
+   dialog; the previous value is restored once the reboot is done.
+2. **Force-kills** Studio (`SIGKILL`) — a killed process can't raise the "Don't
    Save" prompt.
-2. **Deletes the auto-recovery files** — with nothing to restore, the restore
+3. **Deletes the auto-recovery files** — with nothing to restore, the restore
    prompt has nothing to offer. (There is no Studio setting that disables it, so
    removing the files is the only reliable suppression.)
-3. **Relaunches** Studio. A connected Rojo plugin reconnects to the still-running
+4. **Relaunches** Studio. A connected Rojo plugin reconnects to the still-running
    `rojo serve` on its own, because the [session id](#stable-session-id-across-restarts)
    is preserved across the reboot.
 
@@ -143,7 +148,8 @@ separate, platform-specific command. On other platforms it exits with a clear
 
 ```
 rojo studio reset [PROJECT] [--place <FILE>] [--no-launch] [--no-clear-recovery]
-                  [--recovery-path <DIR>] [--restart-serve] [--json]
+                  [--recovery-path <DIR>] [--no-silence-crashes] [--restart-serve]
+                  [--json]
 ```
 
 | Flag | Effect |
@@ -152,10 +158,11 @@ rojo studio reset [PROJECT] [--place <FILE>] [--no-launch] [--no-clear-recovery]
 | `--no-launch` | Kill and clear recovery, but don't relaunch. |
 | `--no-clear-recovery` | Leave the auto-recovery files in place (the restore prompt may then reappear). |
 | `--recovery-path <DIR>` | Override the auto-recovery directory (see below). |
+| `--no-silence-crashes` | Don't suppress the macOS "quit unexpectedly" crash dialog (it is silenced and restored by default). |
 | `--restart-serve` | Also restart the project's `rojo serve` (best-effort), for a full reset of the connection. `PROJECT` selects which server. |
 
 ```json
-{ "killed": true, "recoveryClearedCount": 2, "serveRestarted": false, "relaunched": true }
+{ "killed": true, "crashDialogSuppressed": true, "recoveryClearedCount": 2, "serveRestarted": false, "relaunched": true }
 ```
 
 > **Clearing recovery is destructive by design.** It deletes Studio's
@@ -169,6 +176,28 @@ macOS AutoSaves folder,
 matched by the process name `RobloxStudio`. Both can change across Studio
 versions; if the restore prompt still appears, find the real directory (look for
 recently-modified files there after a crash) and pass it with `--recovery-path`.
+
+**Silencing the crash dialog.** By default the reset toggles a **global** macOS
+preference (`com.apple.CrashReporter DialogType`) to `none` for the duration of
+the reboot and restores it afterward, so the "quit unexpectedly" dialog can't
+block the relaunch. Pass `--no-silence-crashes` to leave the setting untouched.
+To suppress it permanently yourself instead, run once
+`defaults write com.apple.CrashReporter DialogType none` (undo with
+`defaults write com.apple.CrashReporter DialogType crashreport`).
+
+**Make sure your agent actually uses this.** The dialogs only stay gone if every
+reboot goes through `rojo studio reset` (or the `reset_studio` MCP tool). If the
+agent quits Studio any other way — Cmd-Q, the close button, `osascript … quit` —
+Studio gets a *graceful* quit and the "Don't Save" prompt comes back. Two things
+to check:
+
+- The `rojo` the agent runs is a build that has this command
+  (`rojo studio reset --help` should list it). Install it where the agent's
+  `rojo` resolves (e.g. `cargo install --path .`), and rebuild the `rojo mcp`
+  server too if the agent calls `reset_studio`.
+- Most "reboot to see my changes" cycles are unnecessary: `rojo serve`
+  **live-syncs** file changes into a running Studio already. Reserve reboots for
+  playtests or plugin changes — fewer reboots, fewer dialogs.
 
 ---
 

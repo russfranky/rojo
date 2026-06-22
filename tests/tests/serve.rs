@@ -11,7 +11,7 @@ use crate::rojo_test::{
 };
 
 use librojo::{
-    web_api::{SerializeResponse, SocketPacketType},
+    web_api::{FeedbackLogEntry, SerializeResponse, SocketPacketType},
     SessionId,
 };
 
@@ -67,6 +67,74 @@ fn assert_rejected(response: reqwest::blocking::Response) {
         !body_lower.contains("rojo") && !body_lower.contains("rebinding"),
         "rejection body should not identify the server, got {body:?}",
     );
+}
+
+/// Exercises the runtime-feedback loop end to end: the plugin POSTs captured
+/// Output to `/api/feedback`, and it comes back through `/api/logs` (the channel
+/// `rojo logs` and the `read_logs` MCP tool read). No Studio is involved — we
+/// POST directly — so this runs in CI.
+#[test]
+fn feedback_and_logs_roundtrip() {
+    fn entry(level: &str, message: &str, run_mode: &str) -> FeedbackLogEntry {
+        FeedbackLogEntry {
+            timestamp_unix_ms: 0,
+            level: level.to_owned(),
+            message: message.to_owned(),
+            run_mode: run_mode.to_owned(),
+        }
+    }
+
+    run_serve_test("empty", |session, _redactions| {
+        let info = session.get_api_rojo().unwrap();
+
+        // Nothing captured yet.
+        let initial = session.get_api_logs("");
+        assert_eq!(initial.session_id, info.session_id);
+        assert!(initial.entries.is_empty());
+        assert_eq!(initial.dropped, 0);
+
+        // The plugin POSTs a batch of captured Output.
+        let response = session.post_api_feedback(
+            info.session_id,
+            vec![
+                entry("print", "hello", "edit"),
+                entry("error", "boom", "client"),
+            ],
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Both come back, oldest first, with levels/run-modes preserved.
+        let all = session.get_api_logs("");
+        let messages: Vec<&str> = all.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["hello", "boom"]);
+        assert_eq!(all.entries[1].level, "error");
+        assert_eq!(all.entries[1].run_mode, "client");
+        assert_eq!(all.tail_seq, 2);
+
+        // The level filter keeps only the error.
+        let errors = session.get_api_logs("?level=error");
+        let error_messages: Vec<&str> = errors.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(error_messages, vec!["boom"]);
+
+        // since= returns only entries newer than the cursor.
+        let newer = session.get_api_logs("?since=0");
+        let newer_messages: Vec<&str> = newer.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(newer_messages, vec!["boom"]);
+
+        // A wrong session id is rejected and doesn't append.
+        let bad = session.post_api_feedback(SessionId::new(), vec![entry("print", "nope", "edit")]);
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(session.get_api_logs("").entries.len(), 2);
+
+        // The `rojo logs` CLI reads the same buffer (discover_running + /api/logs).
+        let cli = session.logs_via_cli(&[]);
+        let cli_messages: Vec<&str> = cli.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(cli_messages, vec!["hello", "boom"]);
+
+        let cli_errors = session.logs_via_cli(&["--level", "error"]);
+        assert_eq!(cli_errors.entries.len(), 1);
+        assert_eq!(cli_errors.entries[0].message, "boom");
+    });
 }
 
 #[test]

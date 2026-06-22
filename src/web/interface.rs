@@ -25,7 +25,10 @@ use crate::{
 pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Current protocol version, which is required to match.
-pub const PROTOCOL_VERSION: u64 = 5;
+///
+/// Bumped to 6 when the plugin began POSTing captured Output to `/api/feedback`;
+/// the plugin's `Config.protocolVersion` must match.
+pub const PROTOCOL_VERSION: u64 = 6;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,6 +231,60 @@ pub struct WriteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct WriteResponse {
     pub session_id: SessionId,
+}
+
+/// Request body for `/api/feedback` (Studio plugin → server, msgpack): a batch
+/// of captured `LogService` output. `level`/`runMode` are sent as strings and
+/// parsed leniently server-side, so a slightly-off client isn't rejected.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackRequest {
+    pub session_id: SessionId,
+    pub entries: Vec<FeedbackLogEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackLogEntry {
+    pub timestamp_unix_ms: u64,
+    pub level: String,
+    pub message: String,
+    pub run_mode: String,
+}
+
+/// Response body from `/api/feedback`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackResponse {
+    pub session_id: SessionId,
+    /// How many entries were accepted into the buffer.
+    pub accepted: u64,
+}
+
+/// A single captured log line as returned by `/api/logs`. `level` and `runMode`
+/// are wire strings (e.g. "print"/"warning", "edit"/"client"/"server").
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntryView {
+    pub seq: u64,
+    pub timestamp_unix_ms: u64,
+    pub level: String,
+    pub message: String,
+    pub run_mode: String,
+}
+
+/// Response body from `/api/logs` (server → CLI; JSON for `rojo logs`, msgpack
+/// otherwise). `tailSeq` can be passed back as `since` to fetch only newer
+/// entries; `dropped` reports how many old entries fell out of the bounded
+/// buffer (a non-zero jump means the reader missed some).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsResponse {
+    pub session_id: SessionId,
+    pub head_seq: u64,
+    pub tail_seq: u64,
+    pub dropped: u64,
+    pub entries: Vec<LogEntryView>,
 }
 
 /// Packet type enum for different websocket message types

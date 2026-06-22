@@ -2,22 +2,28 @@
 //! application on the machine running Rojo.
 //!
 //! Its one subcommand today, `rojo studio reset`, force-restarts Studio without
-//! the two native dialogs that otherwise need a human click — the "Don't Save"
-//! prompt on close and the auto-recovery "restore" prompt on the next launch —
-//! so an agent driving a serve/test loop can reboot Studio unattended.
+//! the native dialogs that otherwise need a human click — the "Don't Save"
+//! prompt on close, the macOS "quit unexpectedly" crash dialog after a
+//! force-kill, and the auto-recovery "restore" prompt on the next launch — so an
+//! agent driving a serve/test loop can reboot Studio unattended.
 //!
 //! Studio is a native app, not something Rojo's Luau plugin can drive (the
 //! recovery prompt even appears before any plugin loads), so this is done with
 //! OS commands and is currently macOS only. The dialog-free recipe is:
 //!
-//! 1. SIGKILL Studio — a killed process can't raise the "Don't Save" prompt.
-//! 2. Delete the auto-recovery files — with nothing to restore, the restore
+//! 1. Silence macOS's crash reporter (`com.apple.CrashReporter DialogType
+//!    none`) for the duration. Force-killing Studio exits it abnormally, which
+//!    otherwise raises the system "RobloxStudio quit unexpectedly" dialog; the
+//!    previous setting is restored once the reboot is done.
+//! 2. SIGKILL Studio — a killed process can't raise the "Don't Save" prompt.
+//! 3. Delete the auto-recovery files — with nothing to restore, the restore
 //!    prompt has nothing to offer. (There is no Studio setting that disables it.)
-//! 3. Relaunch Studio; the Rojo plugin reconnects to the still-running
+//! 4. Relaunch Studio; the Rojo plugin reconnects to the still-running
 //!    `rojo serve` on its own, since the session id is preserved across the
 //!    reboot.
 
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -28,7 +34,7 @@ use anyhow::Context;
 use clap::Parser;
 use serde::Serialize;
 
-use super::{output, resolve_path, GlobalOptions};
+use super::{output, resolve_path, resolve_project_root, serve_control, GlobalOptions};
 
 /// The macOS process name matched when force-killing Studio. `pkill -f` matches
 /// it as a substring of the full command line, so this also catches
@@ -38,6 +44,13 @@ const STUDIO_PROCESS_MATCH: &str = "RobloxStudio";
 /// The macOS application name passed to `open -a` to (re)launch Studio. Launch
 /// Services resolves it to `RobloxStudio.app` without needing its full path.
 const STUDIO_APP_NAME: &str = "RobloxStudio";
+
+/// The macOS `defaults` domain controlling the system crash reporter.
+const CRASH_REPORTER_DOMAIN: &str = "com.apple.CrashReporter";
+
+/// The `defaults` key whose `none` value suppresses the "quit unexpectedly"
+/// dialog. Set to `none` around the kill, then restored to its prior value.
+const CRASH_REPORTER_KEY: &str = "DialogType";
 
 /// How long to wait (polling) for Studio to actually exit after the kill signal
 /// before clearing recovery files and relaunching.
@@ -53,8 +66,9 @@ pub struct StudioCommand {
 /// Subcommands of `rojo studio`.
 #[derive(Debug, Parser)]
 pub enum StudioSubcommand {
-    /// Force-restart Roblox Studio without the "Don't Save" or auto-recovery
-    /// dialogs, so it can be rebooted unattended during a serve/test loop.
+    /// Force-restart Roblox Studio without the "Don't Save", crash, or
+    /// auto-recovery dialogs, so it can be rebooted unattended during a
+    /// serve/test loop.
     Reset(StudioResetCommand),
 }
 
@@ -74,10 +88,12 @@ impl StudioSubcommand {
 
 /// Force-restarts Roblox Studio with no native dialogs (macOS only).
 ///
-/// Studio is force-killed (SIGKILL, so it can't raise a "Don't Save" prompt),
-/// its auto-recovery files are deleted (so the next launch has nothing to offer
-/// restoring), and then it is relaunched. A connected Rojo plugin reconnects to
-/// the running `rojo serve` on its own, since the session id is preserved.
+/// Studio is force-killed (SIGKILL, so it can't raise a "Don't Save" prompt)
+/// with macOS's crash reporter briefly silenced (so the system "quit
+/// unexpectedly" dialog doesn't appear), its auto-recovery files are deleted (so
+/// the next launch has nothing to offer restoring), and then it is relaunched. A
+/// connected Rojo plugin reconnects to the running `rojo serve` on its own, since
+/// the session id is preserved.
 #[derive(Debug, Parser)]
 pub struct StudioResetCommand {
     /// Path to the project, used only with `--restart-serve`. Defaults to the
@@ -104,10 +120,24 @@ pub struct StudioResetCommand {
     #[clap(long)]
     pub recovery_path: Option<PathBuf>,
 
+    /// Don't silence macOS's "quit unexpectedly" crash dialog during the kill.
+    /// By default it is suppressed (and the prior setting restored afterward) so
+    /// a force-killed Studio reboots without a system dialog to click.
+    #[clap(long)]
+    pub no_silence_crashes: bool,
+
     /// Also restart the project's `rojo serve` (best-effort) for a full reset.
     /// By default serve is left running and the plugin simply reconnects.
     #[clap(long)]
     pub restart_serve: bool,
+
+    /// Don't wait to confirm the Rojo plugin reconnected after Studio relaunches.
+    #[clap(long)]
+    pub no_wait_reconnect: bool,
+
+    /// How long, in seconds, to wait for the plugin to reconnect after relaunch.
+    #[clap(long, default_value = "45")]
+    pub reconnect_timeout: u64,
 }
 
 /// Resolved inputs for [`plan_reset`], decoupled from clap and the current
@@ -119,7 +149,27 @@ struct ResetInputs {
     no_clear_recovery: bool,
     /// Explicit recovery-directory override (absolute), if any.
     recovery_path: Option<PathBuf>,
+    /// Whether to suppress the macOS crash dialog around the kill.
+    silence_crashes: bool,
     restart_serve: bool,
+}
+
+/// Where and how long to poll for the plugin to reconnect after relaunch.
+/// Computed before the kill (so the baseline client count is known) and consumed
+/// by [`execute_plan`] after Studio is relaunched.
+struct ReconnectTarget {
+    address: IpAddr,
+    port: u16,
+    /// Connected-client count to wait for (the pre-kill count, at least 1).
+    target: u64,
+    timeout: Duration,
+}
+
+/// The connected-client count to treat as "reconnected": the pre-kill count, but
+/// always at least one (we launched Studio, so expect a client even if none was
+/// connected before).
+fn reconnect_target(before_clients: u64) -> u64 {
+    before_clients.max(1)
 }
 
 /// The concrete steps a reset will run, computed up front so the decision logic
@@ -127,6 +177,10 @@ struct ResetInputs {
 /// that the executor runs verbatim.
 #[derive(Debug, PartialEq, Eq)]
 struct ResetPlan {
+    /// `defaults write` command (argv) that suppresses the macOS crash dialog,
+    /// or `None` with `--no-silence-crashes`. The matching restore is computed at
+    /// run time from the value read just before this runs.
+    crash_suppress: Option<Vec<String>>,
     /// Force-kill command (argv). SIGKILL so Studio can't prompt to save.
     kill: Vec<String>,
     /// Auto-recovery directory to clear, or `None` with `--no-clear-recovery`.
@@ -143,12 +197,22 @@ struct ResetPlan {
 struct ResetResult {
     /// Whether a running Studio process was found and killed.
     killed: bool,
+    /// Whether the macOS crash dialog was suppressed for the kill.
+    crash_dialog_suppressed: bool,
     /// Number of auto-recovery entries deleted.
     recovery_cleared_count: usize,
     /// Whether `rojo serve` was restarted (only with `--restart-serve`).
     serve_restarted: bool,
     /// Whether Studio was relaunched.
     relaunched: bool,
+    /// Whether the Studio plugin reconnected after relaunch. `None` when not
+    /// checked (no server running, `--no-launch`, `--no-wait-reconnect`, or
+    /// `--restart-serve`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_reconnected: Option<bool>,
+    /// Connected-client count observed after relaunch, when reconnect was checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connected_clients_after: Option<u64>,
 }
 
 /// Studio's default macOS auto-recovery directory. There is no Studio setting to
@@ -164,6 +228,18 @@ fn default_recovery_dir(home: &Path) -> PathBuf {
 /// Builds the [`ResetPlan`] from resolved inputs. Pure: no filesystem or process
 /// access, so it can be exercised on any platform in unit tests.
 fn plan_reset(inputs: &ResetInputs, home: &Path) -> ResetPlan {
+    let crash_suppress = if inputs.silence_crashes {
+        Some(vec![
+            "defaults".to_owned(),
+            "write".to_owned(),
+            CRASH_REPORTER_DOMAIN.to_owned(),
+            CRASH_REPORTER_KEY.to_owned(),
+            "none".to_owned(),
+        ])
+    } else {
+        None
+    };
+
     let kill = vec![
         "pkill".to_owned(),
         "-9".to_owned(),
@@ -197,6 +273,7 @@ fn plan_reset(inputs: &ResetInputs, home: &Path) -> ResetPlan {
     };
 
     ResetPlan {
+        crash_suppress,
         kill,
         recovery_dir,
         restart_serve: inputs.restart_serve,
@@ -207,10 +284,11 @@ fn plan_reset(inputs: &ResetInputs, home: &Path) -> ResetPlan {
 impl StudioResetCommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
         // This is OS automation specific to macOS (process names, `open`, the
-        // recovery path). Bail clearly elsewhere rather than running commands
-        // that don't exist there. Using `std::env::consts::OS` keeps it a runtime
-        // check, so the executor below still compiles — and is unit-tested — on
-        // every platform in the CI matrix.
+        // recovery path, the crash-reporter default). Bail clearly elsewhere
+        // rather than running commands that don't exist there. Using
+        // `std::env::consts::OS` keeps it a runtime check, so the executor below
+        // still compiles — and is unit-tested — on every platform in the CI
+        // matrix.
         if std::env::consts::OS != "macos" {
             anyhow::bail!(
                 "`rojo studio reset` is currently only supported on macOS (detected: {}).",
@@ -239,13 +317,30 @@ impl StudioResetCommand {
             no_launch: self.no_launch,
             no_clear_recovery: self.no_clear_recovery,
             recovery_path,
+            silence_crashes: !self.no_silence_crashes,
             restart_serve: self.restart_serve,
         };
 
         let home = home_dir()?;
         let plan = plan_reset(&inputs, &home);
 
-        let result = execute_plan(&plan, &self.project)?;
+        // Discover the running server before the kill so we know where to poll and
+        // the baseline client count to wait for. Skipped when we won't relaunch,
+        // when asked not to wait, or when restarting serve (which bounces the
+        // server and makes the baseline meaningless).
+        let reconnect = if self.no_launch || self.no_wait_reconnect || self.restart_serve {
+            None
+        } else {
+            let root_dir = resolve_project_root(&self.project)?;
+            serve_control::discover_running(&root_dir).map(|(state, health)| ReconnectTarget {
+                address: state.address,
+                port: state.port,
+                target: reconnect_target(health.connected_clients),
+                timeout: Duration::from_secs(self.reconnect_timeout),
+            })
+        };
+
+        let result = execute_plan(&plan, &self.project, reconnect)?;
 
         output::emit(&global, &result, || {
             let mut parts = vec![if result.killed {
@@ -253,6 +348,9 @@ impl StudioResetCommand {
             } else {
                 "no running Studio found".to_owned()
             }];
+            if result.crash_dialog_suppressed {
+                parts.push("silenced the macOS crash dialog".to_owned());
+            }
             if plan.recovery_dir.is_some() {
                 parts.push(format!(
                     "cleared {} recovery file(s)",
@@ -267,17 +365,36 @@ impl StudioResetCommand {
             } else {
                 "did not relaunch".to_owned()
             });
+            match result.plugin_reconnected {
+                Some(true) => parts.push("plugin reconnected".to_owned()),
+                Some(false) => parts.push("plugin did NOT reconnect in time".to_owned()),
+                None => {}
+            }
             println!("Studio reset: {}.", parts.join("; "));
             Ok(())
         })
     }
 }
 
-/// Runs the planned steps in order: kill → clear recovery → (restart serve) →
-/// relaunch. Killing and clearing are best-effort (a missing Studio or recovery
-/// directory is fine); a failed *relaunch* is fatal, since getting Studio back up
-/// is the point of the command.
-fn execute_plan(plan: &ResetPlan, project: &Path) -> anyhow::Result<ResetResult> {
+/// Runs the planned steps in order: silence crash dialog → kill → clear recovery
+/// → (restart serve) → relaunch → restore crash dialog. Killing and clearing are
+/// best-effort (a missing Studio or recovery directory is fine); a failed
+/// *relaunch* is fatal, since getting Studio back up is the point of the command.
+fn execute_plan(
+    plan: &ResetPlan,
+    project: &Path,
+    reconnect: Option<ReconnectTarget>,
+) -> anyhow::Result<ResetResult> {
+    // Silence macOS's crash reporter around the force-kill so Studio's abnormal
+    // exit doesn't raise the system "quit unexpectedly" dialog. The guard
+    // restores the prior setting when it drops — including on an early return
+    // from a failed relaunch — so the window of suppression is just the reboot.
+    let crash_guard = plan
+        .crash_suppress
+        .as_deref()
+        .map(CrashReporterGuard::engage);
+    let crash_dialog_suppressed = crash_guard.is_some();
+
     let killed = run_kill(&plan.kill)?;
 
     // Give a killed Studio a moment to exit and release its files before we
@@ -305,12 +422,118 @@ fn execute_plan(plan: &ResetPlan, project: &Path) -> anyhow::Result<ResetResult>
         None => false,
     };
 
+    // Restore the crash-reporter setting now the kill-dialog window has passed
+    // (before the potentially long reconnect wait below).
+    drop(crash_guard);
+
+    // If we relaunched and have a server to check, wait for the plugin to
+    // reconnect so the result reflects whether Studio actually came back online.
+    let (plugin_reconnected, connected_clients_after) = match reconnect {
+        Some(target) if relaunched => {
+            let reached = serve_control::wait_until_clients_at_least(
+                target.address,
+                target.port,
+                target.target,
+                target.timeout,
+            );
+            let after = serve_control::probe(target.address, target.port)
+                .map(|health| health.connected_clients);
+            (Some(reached), after)
+        }
+        _ => (None, None),
+    };
+
     Ok(ResetResult {
         killed,
+        crash_dialog_suppressed,
         recovery_cleared_count,
         serve_restarted,
         relaunched,
+        plugin_reconnected,
+        connected_clients_after,
     })
+}
+
+/// Suppresses macOS's "quit unexpectedly" dialog for the lifetime of the value,
+/// restoring `com.apple.CrashReporter DialogType` to whatever it was before on
+/// drop. Every step is best-effort: if `defaults` isn't cooperating we log and
+/// carry on rather than abort the reboot.
+struct CrashReporterGuard {
+    /// The prior `DialogType` value to restore, or `None` if it was unset.
+    prior: Option<String>,
+}
+
+impl CrashReporterGuard {
+    /// Reads and stashes the current `DialogType`, then applies `write_argv`
+    /// (the `defaults write … none` command from the plan).
+    fn engage(write_argv: &[String]) -> Self {
+        let prior = read_default(CRASH_REPORTER_DOMAIN, CRASH_REPORTER_KEY);
+        if !run_best_effort(write_argv) {
+            log::warn!(
+                "Could not silence the macOS crash reporter; a \"quit unexpectedly\" \
+                 dialog may appear when Studio is killed."
+            );
+        }
+        CrashReporterGuard { prior }
+    }
+}
+
+impl Drop for CrashReporterGuard {
+    fn drop(&mut self) {
+        let restore = match &self.prior {
+            Some(value) => vec![
+                "defaults".to_owned(),
+                "write".to_owned(),
+                CRASH_REPORTER_DOMAIN.to_owned(),
+                CRASH_REPORTER_KEY.to_owned(),
+                value.clone(),
+            ],
+            // It was unset before; remove our override so the OS default returns.
+            None => vec![
+                "defaults".to_owned(),
+                "delete".to_owned(),
+                CRASH_REPORTER_DOMAIN.to_owned(),
+                CRASH_REPORTER_KEY.to_owned(),
+            ],
+        };
+        if !run_best_effort(&restore) {
+            log::warn!(
+                "Could not restore the macOS crash-reporter setting ({} {}). Re-enable \
+                 it with `defaults write {} {} crashreport` if needed.",
+                CRASH_REPORTER_DOMAIN,
+                CRASH_REPORTER_KEY,
+                CRASH_REPORTER_DOMAIN,
+                CRASH_REPORTER_KEY,
+            );
+        }
+    }
+}
+
+/// Reads a `defaults` value, returning `None` if it is unset or unreadable.
+fn read_default(domain: &str, key: &str) -> Option<String> {
+    let output = Command::new("defaults")
+        .args(["read", domain, key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Runs a command for its side effect, returning whether it exited successfully.
+/// Used for the `defaults` calls, where a failure is logged but never fatal.
+fn run_best_effort(argv: &[String]) -> bool {
+    Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Force-kills Studio. Returns whether at least one process was signaled; "no
@@ -454,6 +677,7 @@ mod tests {
             no_launch: false,
             no_clear_recovery: false,
             recovery_path: None,
+            silence_crashes: true,
             restart_serve: false,
         }
     }
@@ -478,6 +702,27 @@ mod tests {
             Some("open -a RobloxStudio")
         );
         assert!(!plan.restart_serve);
+    }
+
+    #[test]
+    fn plan_silences_crash_dialog_by_default() {
+        let plan = plan_reset(&inputs(), &home());
+
+        assert_eq!(
+            plan.crash_suppress
+                .as_ref()
+                .map(|argv| argv.join(" "))
+                .as_deref(),
+            Some("defaults write com.apple.CrashReporter DialogType none")
+        );
+    }
+
+    #[test]
+    fn plan_no_silence_crashes_opts_out() {
+        let mut i = inputs();
+        i.silence_crashes = false;
+
+        assert_eq!(plan_reset(&i, &home()).crash_suppress, None);
     }
 
     #[test]
@@ -548,8 +793,28 @@ mod tests {
             StudioSubcommand::Reset(reset) => {
                 assert!(reset.no_launch);
                 assert!(reset.restart_serve);
+                assert!(!reset.no_silence_crashes);
                 assert_eq!(reset.place, Some(PathBuf::from("game.rbxl")));
             }
         }
+    }
+
+    #[test]
+    fn parses_no_silence_crashes_flag() {
+        let cmd =
+            StudioCommand::try_parse_from(["studio", "reset", "--no-silence-crashes"]).unwrap();
+
+        match cmd.subcommand {
+            StudioSubcommand::Reset(reset) => assert!(reset.no_silence_crashes),
+        }
+    }
+
+    #[test]
+    fn reconnect_target_is_at_least_one() {
+        // We launched Studio, so always expect at least one client back, even if
+        // none was connected before; otherwise wait for the prior count.
+        assert_eq!(reconnect_target(0), 1);
+        assert_eq!(reconnect_target(1), 1);
+        assert_eq!(reconnect_target(3), 3);
     }
 }

@@ -15,8 +15,9 @@ use tempfile::{tempdir, TempDir};
 
 use librojo::{
     web_api::{
-        HealthResponse, ReadResponse, SerializeRequest, SerializeResponse, ServerInfoResponse,
-        SocketPacket, SocketPacketType, StopRequest,
+        FeedbackLogEntry, FeedbackRequest, HealthResponse, LogsResponse, ReadResponse,
+        SerializeRequest, SerializeResponse, ServerInfoResponse, SocketPacket, SocketPacketType,
+        StopRequest,
     },
     SessionId,
 };
@@ -183,6 +184,67 @@ impl TestServeSession {
         let body = reqwest::blocking::get(url)?.bytes()?;
 
         Ok(deserialize_msgpack(&body).expect("Server returned malformed response"))
+    }
+
+    /// POSTs a batch of captured Output to `/api/feedback` as the Studio plugin
+    /// would (msgpack body), returning the raw response so the caller can assert
+    /// on the status code.
+    pub fn post_api_feedback(
+        &self,
+        session_id: SessionId,
+        entries: Vec<FeedbackLogEntry>,
+    ) -> reqwest::blocking::Response {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://localhost:{}/api/feedback", self.port);
+        let body = serialize_msgpack(&FeedbackRequest {
+            session_id,
+            entries,
+        })
+        .unwrap();
+
+        client
+            .post(url)
+            .body(body)
+            .send()
+            .expect("Failed to send request")
+    }
+
+    /// GETs `/api/logs` as the CLI does (asking for JSON), with the given raw
+    /// query string (e.g. `"?level=error"` or `""`), and parses the response.
+    pub fn get_api_logs(&self, query: &str) -> LogsResponse {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://localhost:{}/api/logs{}", self.port, query);
+
+        let response = client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json().expect("Server returned malformed JSON")
+    }
+
+    /// Runs `rojo logs --json [extra_args]` against this server (the CLI discovers
+    /// it via the project's serve-state file) and parses the result. Exercises the
+    /// full `rojo logs` path, not just the raw endpoint.
+    pub fn logs_via_cli(&self, extra_args: &[&str]) -> LogsResponse {
+        let mut args = vec!["logs", "--json"];
+        args.extend_from_slice(extra_args);
+
+        let output = Command::new(ROJO_PATH)
+            .args(&args)
+            .current_dir(&self.project_path)
+            .output()
+            .expect("Failed to run `rojo logs`");
+
+        assert!(
+            output.status.success(),
+            "`rojo logs` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        serde_json::from_slice(&output.stdout).expect("`rojo logs --json` returned malformed JSON")
     }
 
     /// The OS process id of the running `rojo serve`, i.e. the pid the server

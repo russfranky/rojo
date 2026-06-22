@@ -7,6 +7,7 @@ Model Context Protocol (MCP) server.
 - [Connection resilience](#connection-resilience)
 - [Server lifecycle commands](#server-lifecycle-commands)
 - [`rojo test`](#rojo-test)
+- [`rojo logs`](#rojo-logs)
 - [`rojo gen`](#rojo-gen)
 - [Machine-readable output (`--json`)](#machine-readable-output---json)
 - [Project hooks](#project-hooks)
@@ -121,18 +122,23 @@ current terminal instead.
 
 ## Rebooting Studio unattended (`rojo studio reset`)
 
-**macOS only.** Rebooting Roblox Studio normally needs a human to click two
-native dialogs: **"Don't Save"** when closing with unsaved changes, and the
-auto-recovery **"restore"** prompt on the next launch. That stalls an agent
-driving a serve/test loop. `rojo studio reset` force-restarts Studio without
-either dialog:
+**macOS only.** Rebooting Roblox Studio normally needs a human to click through
+up to three native dialogs: **"Don't Save"** when closing with unsaved changes,
+the macOS **"RobloxStudio quit unexpectedly"** crash dialog after a force-kill,
+and the auto-recovery **"restore"** prompt on the next launch. That stalls an
+agent driving a serve/test loop. `rojo studio reset` force-restarts Studio
+without any of them:
 
-1. **Force-kills** Studio (`SIGKILL`) — a killed process can't raise the "Don't
+1. **Silences the macOS crash reporter** for the reboot
+   (`defaults write com.apple.CrashReporter DialogType none`). A force-killed app
+   exits abnormally, which otherwise raises the system "quit unexpectedly"
+   dialog; the previous value is restored once the reboot is done.
+2. **Force-kills** Studio (`SIGKILL`) — a killed process can't raise the "Don't
    Save" prompt.
-2. **Deletes the auto-recovery files** — with nothing to restore, the restore
+3. **Deletes the auto-recovery files** — with nothing to restore, the restore
    prompt has nothing to offer. (There is no Studio setting that disables it, so
    removing the files is the only reliable suppression.)
-3. **Relaunches** Studio. A connected Rojo plugin reconnects to the still-running
+4. **Relaunches** Studio. A connected Rojo plugin reconnects to the still-running
    `rojo serve` on its own, because the [session id](#stable-session-id-across-restarts)
    is preserved across the reboot.
 
@@ -143,7 +149,8 @@ separate, platform-specific command. On other platforms it exits with a clear
 
 ```
 rojo studio reset [PROJECT] [--place <FILE>] [--no-launch] [--no-clear-recovery]
-                  [--recovery-path <DIR>] [--restart-serve] [--json]
+                  [--recovery-path <DIR>] [--no-silence-crashes] [--restart-serve]
+                  [--json]
 ```
 
 | Flag | Effect |
@@ -152,10 +159,11 @@ rojo studio reset [PROJECT] [--place <FILE>] [--no-launch] [--no-clear-recovery]
 | `--no-launch` | Kill and clear recovery, but don't relaunch. |
 | `--no-clear-recovery` | Leave the auto-recovery files in place (the restore prompt may then reappear). |
 | `--recovery-path <DIR>` | Override the auto-recovery directory (see below). |
+| `--no-silence-crashes` | Don't suppress the macOS "quit unexpectedly" crash dialog (it is silenced and restored by default). |
 | `--restart-serve` | Also restart the project's `rojo serve` (best-effort), for a full reset of the connection. `PROJECT` selects which server. |
 
 ```json
-{ "killed": true, "recoveryClearedCount": 2, "serveRestarted": false, "relaunched": true }
+{ "killed": true, "crashDialogSuppressed": true, "recoveryClearedCount": 2, "serveRestarted": false, "relaunched": true }
 ```
 
 > **Clearing recovery is destructive by design.** It deletes Studio's
@@ -170,6 +178,28 @@ matched by the process name `RobloxStudio`. Both can change across Studio
 versions; if the restore prompt still appears, find the real directory (look for
 recently-modified files there after a crash) and pass it with `--recovery-path`.
 
+**Silencing the crash dialog.** By default the reset toggles a **global** macOS
+preference (`com.apple.CrashReporter DialogType`) to `none` for the duration of
+the reboot and restores it afterward, so the "quit unexpectedly" dialog can't
+block the relaunch. Pass `--no-silence-crashes` to leave the setting untouched.
+To suppress it permanently yourself instead, run once
+`defaults write com.apple.CrashReporter DialogType none` (undo with
+`defaults write com.apple.CrashReporter DialogType crashreport`).
+
+**Make sure your agent actually uses this.** The dialogs only stay gone if every
+reboot goes through `rojo studio reset` (or the `reset_studio` MCP tool). If the
+agent quits Studio any other way — Cmd-Q, the close button, `osascript … quit` —
+Studio gets a *graceful* quit and the "Don't Save" prompt comes back. Two things
+to check:
+
+- The `rojo` the agent runs is a build that has this command
+  (`rojo studio reset --help` should list it). Install it where the agent's
+  `rojo` resolves (e.g. `cargo install --path .`), and rebuild the `rojo mcp`
+  server too if the agent calls `reset_studio`.
+- Most "reboot to see my changes" cycles are unnecessary: `rojo serve`
+  **live-syncs** file changes into a running Studio already. Reserve reboots for
+  playtests or plugin changes — fewer reboots, fewer dialogs.
+
 ---
 
 ## `rojo test`
@@ -178,15 +208,24 @@ Runs a project's Luau tests with a pluggable runner. Rojo does not ship a Luau
 runtime, so this orchestrates an external one.
 
 ```
-rojo test [PROJECT] [--runner <run-in-roblox|lune|custom>] [--script <PATH>]
+rojo test [PROJECT] [--runner <lune|custom|run-in-roblox>] [--script <PATH>]
           [--place <PATH>] [--json] [-- <ARGS>...]
 ```
 
 | Runner | Needs | Notes |
 | --- | --- | --- |
-| `run-in-roblox` (default) | `run-in-roblox` binary + Studio | Highest fidelity: builds a place and runs your bootstrap script inside real Studio. |
-| `lune` | `lune` binary | Fast and CI-friendly, but only a subset of Roblox APIs is available. |
-| `custom` | your command (after `--`) | Runs an arbitrary command; the built place path is exposed via `ROJO_TEST_PLACE`. |
+| `lune` | `lune` binary | Fast, headless, CI-friendly — best for pure-logic tests. Exposes only a subset of Roblox APIs and **can't boot a real `DataModel`**, so it can't test engine-dependent code. |
+| `custom` | your command (after `--`) | Runs an arbitrary command; the built place path is exposed via `ROJO_TEST_PLACE`. Use it to plug in your own boot harness. |
+| `run-in-roblox` (default, legacy) | `run-in-roblox` binary + Studio | Builds a place and runs your bootstrap script inside real Studio. ⚠️ **`run-in-roblox`'s only release is v0.3.0 (July 2020)** — driving a current Studio with a 5½-year-old tool is a real compatibility gamble. See the recommendation below. |
+
+> **Testing in a live Studio? Don't reach for `run-in-roblox`.** The maintained
+> way to run Luau in an open Studio is the official [Roblox Studio MCP
+> server](https://create.roblox.com/docs/studio/mcp)'s `run_code` /
+> `execute_luau`: point it at a Studio you keep open with
+> [`rojo studio reset`](#rebooting-studio-unattended-rojo-studio-reset) and run
+> your test entrypoint (e.g. `IntegrationTests.runAll()`) there, reading results
+> back from the call and from [`rojo logs`](#rojo-logs). See the
+> [agent workflow guide](./agent-workflow.md) for the full loop.
 
 - `--script` is the test entry/bootstrap script (required for `run-in-roblox`
   and `lune`); it is resolved to an absolute path.
@@ -204,6 +243,38 @@ Examples:
 ```bash
 rojo test --runner lune --script tests/init.luau
 rojo test --runner custom -- ./run-my-tests.sh   # $ROJO_TEST_PLACE is set
+```
+
+---
+
+## `rojo logs`
+
+Prints the recent Output — `print`s, warnings, and errors — captured from the
+connected Roblox Studio session. This is the read side of Rojo's runtime-feedback
+loop: it lets an agent *see what happened when the game ran* (script errors, test
+output, debug prints) without a human watching the Output window.
+
+The Studio plugin streams its `LogService` output to the running `rojo serve`
+(via `POST /api/feedback`), which keeps it in a bounded in-memory buffer; this
+command (and the `read_logs` MCP tool) read it back.
+
+```
+rojo logs [PROJECT] [--since <SEQ>] [--level <print|info|warning|error>]
+          [--limit <N>] [--json]
+```
+
+- Requires a running server for the project (`rojo serve`) with the plugin
+  connected and output capture enabled (on by default — the plugin's
+  `captureOutput` setting).
+- Output is captured in both edit and play (playtest) modes.
+- `--level` filters by minimum severity; `--limit` keeps the newest N entries.
+- `--since <SEQ>` returns only entries newer than a sequence number. Each call
+  reports a `tailSeq`; pass it back as `--since` next time to poll for only the
+  new lines without re-seeing old ones.
+
+```bash
+rojo logs --level warning          # only warnings and errors
+rojo logs --since 1240 --json      # new lines since seq 1240, machine-readable
 ```
 
 ---
@@ -339,6 +410,8 @@ rojo mcp [PROJECT] [--read-only]
 | `sourcemap` | no | The project's instance tree (best for navigation). |
 | `read_instance` | no | One instance's class, property values, and immediate children, located by a slash-separated path from the root (e.g. `ReplicatedStorage/Shared/MyModule`). |
 | `status` | no | Whether a server is running, and its details. |
+| `connection` | no | Connectivity summary — `connected`, `connectedClients`, `sessionId`, `uptimeSeconds`, `running`. Check before expecting live sync or `read_logs` to reflect Studio. |
+| `read_logs` | no | Recent Studio Output (prints/warnings/errors) captured at runtime, e.g. after a playtest. Filter by `level`/`limit`; poll with `since`. |
 | `build` | yes | Build the project to a `.rbxl`/`.rbxlx`/`.rbxm`/`.rbxmx` file. |
 | `gen_script` | yes | Scaffold a server/client/module script. |
 | `stop` | yes | Stop the running server. |
@@ -348,8 +421,8 @@ rojo mcp [PROJECT] [--read-only]
 ### Read-only mode
 
 `--read-only` exposes only the non-mutating tools (`sourcemap`, `read_instance`,
-`status`); the mutating tools are hidden and rejected. This is the safe default
-for untrusted sessions.
+`status`, `connection`, `read_logs`); the mutating tools are hidden and rejected.
+This is the safe default for untrusted sessions.
 
 ### Safety
 

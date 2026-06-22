@@ -13,11 +13,13 @@ use rbx_dom_weak::{
 };
 
 use crate::{
+    log_buffer::{IncomingLogEntry, LogLevel, RunMode},
     serve_session::ServeSession,
     snapshot::{InstanceWithMeta, PatchSet, PatchUpdate},
     web::{
         interface::{
-            ErrorResponse, HealthResponse, Instance, MessagesPacket, OpenResponse, ReadResponse,
+            ErrorResponse, FeedbackRequest, FeedbackResponse, HealthResponse, Instance,
+            LogEntryView, LogsResponse, MessagesPacket, OpenResponse, ReadResponse,
             ServerInfoResponse, SocketPacket, SocketPacketBody, SocketPacketType, StopRequest,
             StopResponse, SubscribeMessage, WriteRequest, WriteResponse, PROTOCOL_VERSION,
             SERVER_VERSION,
@@ -42,6 +44,7 @@ pub async fn call(
         (&Method::GET, "/api/health") | (&Method::GET, "/api/status") => {
             service.handle_api_health(&request).await
         }
+        (&Method::GET, "/api/logs") => service.handle_api_logs(&request).await,
         (&Method::POST, "/api/stop") => service.handle_api_stop(request).await,
         (&Method::GET, path) if path.starts_with("/api/read/") => {
             service.handle_api_read(request).await
@@ -65,6 +68,7 @@ pub async fn call(
             service.handle_api_open(request).await
         }
         (&Method::POST, "/api/write") => service.handle_api_write(request).await,
+        (&Method::POST, "/api/feedback") => service.handle_api_feedback(request).await,
 
         (_method, path) => msgpack(
             ErrorResponse::not_found(format!("Route not found: {}", path)),
@@ -271,6 +275,94 @@ impl ApiService {
             .unwrap();
 
         msgpack_ok(WriteResponse { session_id })
+    }
+
+    /// Ingests a batch of captured Studio Output into the session's log buffer.
+    /// Trust-equivalent to `/api/write` (both accept data from the connected
+    /// plugin): the session id must match, and the batch size is capped so one
+    /// request can't balloon memory.
+    async fn handle_api_feedback(&self, request: Request<Body>) -> Response<Body> {
+        let session_id = self.serve_session.session_id();
+
+        let body = body::to_bytes(request.into_body()).await.unwrap();
+
+        let request: FeedbackRequest = match deserialize_msgpack(&body) {
+            Ok(request) => request,
+            Err(err) => {
+                return msgpack(
+                    ErrorResponse::bad_request(format!("Invalid body: {}", err)),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+
+        if request.session_id != session_id {
+            return msgpack(
+                ErrorResponse::bad_request("Wrong session ID"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+
+        if request.entries.len() > MAX_FEEDBACK_ENTRIES_PER_REQUEST {
+            return msgpack(
+                ErrorResponse::bad_request(format!(
+                    "Too many entries in one request (max {})",
+                    MAX_FEEDBACK_ENTRIES_PER_REQUEST
+                )),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+
+        let incoming = request.entries.into_iter().map(|entry| IncomingLogEntry {
+            timestamp_unix_ms: entry.timestamp_unix_ms,
+            level: LogLevel::from_wire(&entry.level),
+            message: entry.message,
+            run_mode: RunMode::from_wire(&entry.run_mode),
+        });
+
+        let accepted = self.serve_session.log_buffer().push_batch(incoming);
+
+        msgpack_ok(FeedbackResponse {
+            session_id,
+            accepted,
+        })
+    }
+
+    /// Returns a filtered snapshot of captured Studio Output. Used by `rojo logs`
+    /// (JSON) and the `read_logs` MCP tool. Query params: `since` (seq cursor,
+    /// exclusive), `level` (minimum severity), `limit` (max entries; newest kept).
+    async fn handle_api_logs(&self, request: &Request<Body>) -> Response<Body> {
+        let query = request.uri().query().unwrap_or("");
+        let since = query_param(query, "since").and_then(|value| value.parse::<u64>().ok());
+        let level = query_param(query, "level").map(LogLevel::from_wire);
+        let limit = query_param(query, "limit").and_then(|value| value.parse::<usize>().ok());
+
+        let snapshot = self
+            .serve_session
+            .log_buffer()
+            .snapshot(since, level, limit);
+
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| LogEntryView {
+                seq: entry.seq,
+                timestamp_unix_ms: entry.timestamp_unix_ms,
+                level: entry.level.as_str().to_owned(),
+                message: entry.message,
+                run_mode: entry.run_mode.as_str().to_owned(),
+            })
+            .collect();
+
+        let response = LogsResponse {
+            session_id: self.serve_session.session_id(),
+            head_seq: snapshot.head_seq,
+            tail_seq: snapshot.tail_seq,
+            dropped: snapshot.dropped,
+            entries,
+        };
+
+        negotiate(accepts_json(request), response, StatusCode::OK)
     }
 
     async fn handle_api_read(&self, request: Request<Body>) -> Response<Body> {
@@ -684,6 +776,19 @@ async fn handle_websocket_subscription(
     }
 
     Ok(())
+}
+
+/// Maximum number of log entries accepted in a single `/api/feedback` request,
+/// bounding the memory one call can consume. The plugin batches well under this.
+const MAX_FEEDBACK_ENTRIES_PER_REQUEST: usize = 4096;
+
+/// Extracts a query-string parameter value by key. Values here are simple
+/// (numbers, level words), so no URL-decoding is needed.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, value) = pair.split_once('=')?;
+        (k == key).then_some(value)
+    })
 }
 
 /// Whether the request's `Accept` header asks for JSON. Used to serve JSON to

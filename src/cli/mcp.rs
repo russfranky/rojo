@@ -287,6 +287,20 @@ struct BuildArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReadLogsArgs {
+    /// Only return entries newer than this sequence number (the `tailSeq` from a
+    /// previous call), so repeated polling doesn't see the same lines twice.
+    #[serde(default)]
+    since: Option<u64>,
+    /// Minimum severity to include: "print", "info", "warning", or "error".
+    #[serde(default)]
+    level: Option<String>,
+    /// Maximum number of entries to return (the newest are kept).
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ResetStudioArgs {
     /// Optional place file to open in Studio after relaunching, relative to the
     /// project. Omit it to launch Studio to its start screen.
@@ -324,6 +338,43 @@ struct ChildView {
     class_name: String,
 }
 
+/// Connectivity summary returned by the `connection` tool: the connectivity
+/// subset of `rojo status`, with an explicit `connected` boolean so the model
+/// doesn't have to reason about `connectedClients > 0` itself.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionView {
+    /// Whether a Rojo server is running for the project.
+    running: bool,
+    /// Whether at least one Studio plugin is attached (connectedClients > 0).
+    connected: bool,
+    connected_clients: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime_seconds: Option<u64>,
+}
+
+/// Distills `rojo status --json` output into a [`ConnectionView`]. Pure, so it's
+/// unit-tested without a running server.
+fn summarize_connection(status_json: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(status_json).map_err(|err| err.to_string())?;
+
+    let running = value["running"].as_bool().unwrap_or(false);
+    let connected_clients = value["connectedClients"].as_u64().unwrap_or(0);
+
+    let view = ConnectionView {
+        running,
+        connected: connected_clients > 0,
+        connected_clients,
+        session_id: value["sessionId"].as_str().map(str::to_owned),
+        uptime_seconds: value["uptimeSeconds"].as_u64(),
+    };
+
+    serde_json::to_string(&view).map_err(|err| err.to_string())
+}
+
 #[tool_router]
 impl RojoMcpServer {
     #[tool(
@@ -352,10 +403,50 @@ impl RojoMcpServer {
 
     #[tool(
         description = "Report whether a Rojo server is running for the project, with its \
-                       address, port, uptime, and connected-client count (JSON)."
+                       address, port, uptime, and whether a Studio plugin is connected \
+                       (connectedClients > 0) (JSON)."
     )]
     fn status(&self) -> Result<String, String> {
         self.run_rojo(&["status", "--json"])
+    }
+
+    #[tool(
+        description = "Read recent Output (prints, warnings, and errors with stack traces) \
+                       captured from the connected Roblox Studio session — the way to observe what \
+                       happened at runtime, e.g. after a playtest. Requires a running Rojo server \
+                       with the Studio plugin connected. Filter with level ('print', 'info', \
+                       'warning', or 'error') and limit; pass since=<tailSeq from a prior call> to \
+                       poll for only new lines."
+    )]
+    fn read_logs(&self, Parameters(args): Parameters<ReadLogsArgs>) -> Result<String, String> {
+        let since = args.since.map(|value| value.to_string());
+        let limit = args.limit.map(|value| value.to_string());
+
+        let mut rojo_args = vec!["logs", "--json"];
+        if let Some(since) = since.as_deref() {
+            rojo_args.push("--since");
+            rojo_args.push(since);
+        }
+        if let Some(level) = args.level.as_deref() {
+            rojo_args.push("--level");
+            rojo_args.push(level);
+        }
+        if let Some(limit) = limit.as_deref() {
+            rojo_args.push("--limit");
+            rojo_args.push(limit);
+        }
+        self.run_rojo(&rojo_args)
+    }
+
+    #[tool(
+        description = "Check whether a Roblox Studio plugin is currently connected to the running \
+                       Rojo server (connected = connectedClients > 0). Returns running, connected, \
+                       connectedClients, sessionId, and uptimeSeconds. Use this before expecting \
+                       live sync or read_logs to reflect what's happening in Studio."
+    )]
+    fn connection(&self) -> Result<String, String> {
+        let status = self.run_rojo(&["status", "--json"])?;
+        summarize_connection(&status)
     }
 
     #[tool(
@@ -415,7 +506,8 @@ impl RojoMcpServer {
                        Studio, deletes its auto-recovery files so no 'restore' prompt appears, \
                        and relaunches it. Optionally open a place file (relative to the project). \
                        Use this to reboot Studio unattended; the Rojo plugin reconnects to the \
-                       running server on its own."
+                       running server on its own, and the result reports whether it reconnected \
+                       (pluginReconnected)."
     )]
     fn reset_studio(
         &self,
@@ -440,10 +532,10 @@ impl ServerHandler for RojoMcpServer {
         info.server_info = Implementation::new("rojo", env!("CARGO_PKG_VERSION"));
 
         let tools = if self.read_only {
-            "sourcemap (instance tree), read_instance, status"
+            "sourcemap (instance tree), read_instance, status, connection, read_logs"
         } else {
-            "sourcemap (instance tree), read_instance, status, build, gen_script, stop, restart, \
-             reset_studio"
+            "sourcemap (instance tree), read_instance, status, connection, read_logs, build, \
+             gen_script, stop, restart, reset_studio"
         };
         let mode = if self.read_only { " (read-only)" } else { "" };
         info.instructions = Some(format!(
@@ -559,5 +651,41 @@ mod tests {
         let server = attributes_server();
 
         assert!(server.read_instance_json("Workspace/DoesNotExist").is_err());
+    }
+
+    #[test]
+    fn summarize_connection_reports_connected() {
+        let json = r#"{"running":true,"connectedClients":2,"sessionId":"abc","uptimeSeconds":12}"#;
+        let summary: serde_json::Value =
+            serde_json::from_str(&summarize_connection(json).unwrap()).unwrap();
+
+        assert_eq!(summary["running"], true);
+        assert_eq!(summary["connected"], true);
+        assert_eq!(summary["connectedClients"], 2);
+        assert_eq!(summary["sessionId"], "abc");
+        assert_eq!(summary["uptimeSeconds"], 12);
+    }
+
+    #[test]
+    fn summarize_connection_handles_not_running() {
+        let summary: serde_json::Value =
+            serde_json::from_str(&summarize_connection(r#"{"running":false}"#).unwrap()).unwrap();
+
+        assert_eq!(summary["running"], false);
+        assert_eq!(summary["connected"], false);
+        assert_eq!(summary["connectedClients"], 0);
+        // Absent optional fields are omitted, not null.
+        assert!(summary.get("sessionId").is_none());
+    }
+
+    #[test]
+    fn read_logs_is_a_read_tool() {
+        // `read_logs` must stay available in --read-only mode, so it must not be
+        // in MUTATING_TOOLS (the list `new` uses to disable routes). Guards
+        // against it being miscategorized as mutating.
+        assert!(!MUTATING_TOOLS.contains(&"read_logs"));
+        // Sanity: the genuinely mutating tools are still listed.
+        assert!(MUTATING_TOOLS.contains(&"build"));
+        assert!(MUTATING_TOOLS.contains(&"reset_studio"));
     }
 }

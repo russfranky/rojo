@@ -35,6 +35,10 @@ local defaultSettings = {
 	typecheckingEnabled = false,
 	logLevel = "Info",
 	timingLogsEnabled = false,
+	-- Stream the Studio Output (prints, warnings, errors) of a connected session
+	-- to the Rojo server, so external tooling (`rojo logs` / the MCP `read_logs`
+	-- tool) can observe runtime results. Local only; goes to your own server.
+	captureOutput = true,
 	priorEndpoints = {},
 }
 

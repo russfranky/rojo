@@ -12,6 +12,7 @@ mod change_processor;
 mod glob;
 mod hooks;
 mod json;
+mod log_buffer;
 mod lua_ast;
 mod message_queue;
 mod multimap;

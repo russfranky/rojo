@@ -13,6 +13,7 @@ local validateApiRead = Types.ifEnabled(Types.ApiReadResponse)
 local validateApiSocketPacket = Types.ifEnabled(Types.ApiSocketPacket)
 local validateApiSerialize = Types.ifEnabled(Types.ApiSerializeResponse)
 local validateApiRefPatch = Types.ifEnabled(Types.ApiRefPatchResponse)
+local validateApiFeedback = Types.ifEnabled(Types.ApiFeedbackResponse)
 
 local function rejectFailedRequests(response)
 	if response.code >= 400 then
@@ -213,6 +214,31 @@ function ApiContext:write(patch)
 		:andThen(Http.Response.msgpack)
 		:andThen(function(responseBody)
 			Log.info("Write response: {:?}", responseBody)
+
+			return responseBody
+		end)
+end
+
+-- Sends a batch of captured log entries to the server's `/api/feedback`. Used by
+-- LogCapture; callers treat failures as soft (a dropped feedback POST must not
+-- disturb the live session).
+function ApiContext:feedback(entries)
+	local url = ("%s/api/feedback"):format(self.__baseUrl)
+
+	local body = Http.msgpackEncode({
+		sessionId = self.__sessionId,
+		entries = entries,
+	})
+
+	return Http.post(url, body)
+		:andThen(rejectFailedRequests)
+		:andThen(Http.Response.msgpack)
+		:andThen(function(responseBody)
+			if responseBody.sessionId ~= self.__sessionId then
+				return Promise.reject("Server changed ID")
+			end
+
+			assert(validateApiFeedback(responseBody))
 
 			return responseBody
 		end)

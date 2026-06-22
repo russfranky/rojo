@@ -287,6 +287,20 @@ struct BuildArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReadLogsArgs {
+    /// Only return entries newer than this sequence number (the `tailSeq` from a
+    /// previous call), so repeated polling doesn't see the same lines twice.
+    #[serde(default)]
+    since: Option<u64>,
+    /// Minimum severity to include: "print", "info", "warning", or "error".
+    #[serde(default)]
+    level: Option<String>,
+    /// Maximum number of entries to return (the newest are kept).
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ResetStudioArgs {
     /// Optional place file to open in Studio after relaunching, relative to the
     /// project. Omit it to launch Studio to its start screen.
@@ -352,10 +366,39 @@ impl RojoMcpServer {
 
     #[tool(
         description = "Report whether a Rojo server is running for the project, with its \
-                       address, port, uptime, and connected-client count (JSON)."
+                       address, port, uptime, and whether a Studio plugin is connected \
+                       (connectedClients > 0) (JSON)."
     )]
     fn status(&self) -> Result<String, String> {
         self.run_rojo(&["status", "--json"])
+    }
+
+    #[tool(
+        description = "Read recent Output (prints, warnings, and errors with stack traces) \
+                       captured from the connected Roblox Studio session — the way to observe what \
+                       happened at runtime, e.g. after a playtest. Requires a running Rojo server \
+                       with the Studio plugin connected. Filter with level ('print', 'info', \
+                       'warning', or 'error') and limit; pass since=<tailSeq from a prior call> to \
+                       poll for only new lines."
+    )]
+    fn read_logs(&self, Parameters(args): Parameters<ReadLogsArgs>) -> Result<String, String> {
+        let since = args.since.map(|value| value.to_string());
+        let limit = args.limit.map(|value| value.to_string());
+
+        let mut rojo_args = vec!["logs", "--json"];
+        if let Some(since) = since.as_deref() {
+            rojo_args.push("--since");
+            rojo_args.push(since);
+        }
+        if let Some(level) = args.level.as_deref() {
+            rojo_args.push("--level");
+            rojo_args.push(level);
+        }
+        if let Some(limit) = limit.as_deref() {
+            rojo_args.push("--limit");
+            rojo_args.push(limit);
+        }
+        self.run_rojo(&rojo_args)
     }
 
     #[tool(
@@ -440,10 +483,10 @@ impl ServerHandler for RojoMcpServer {
         info.server_info = Implementation::new("rojo", env!("CARGO_PKG_VERSION"));
 
         let tools = if self.read_only {
-            "sourcemap (instance tree), read_instance, status"
+            "sourcemap (instance tree), read_instance, status, read_logs"
         } else {
-            "sourcemap (instance tree), read_instance, status, build, gen_script, stop, restart, \
-             reset_studio"
+            "sourcemap (instance tree), read_instance, status, read_logs, build, gen_script, stop, \
+             restart, reset_studio"
         };
         let mode = if self.read_only { " (read-only)" } else { "" };
         info.instructions = Some(format!(
@@ -559,5 +602,16 @@ mod tests {
         let server = attributes_server();
 
         assert!(server.read_instance_json("Workspace/DoesNotExist").is_err());
+    }
+
+    #[test]
+    fn read_logs_is_a_read_tool() {
+        // `read_logs` must stay available in --read-only mode, so it must not be
+        // in MUTATING_TOOLS (the list `new` uses to disable routes). Guards
+        // against it being miscategorized as mutating.
+        assert!(!MUTATING_TOOLS.contains(&"read_logs"));
+        // Sanity: the genuinely mutating tools are still listed.
+        assert!(MUTATING_TOOLS.contains(&"build"));
+        assert!(MUTATING_TOOLS.contains(&"reset_studio"));
     }
 }

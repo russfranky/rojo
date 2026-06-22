@@ -125,6 +125,15 @@ fn feedback_and_logs_roundtrip() {
         let bad = session.post_api_feedback(SessionId::new(), vec![entry("print", "nope", "edit")]);
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
         assert_eq!(session.get_api_logs("").entries.len(), 2);
+
+        // The `rojo logs` CLI reads the same buffer (discover_running + /api/logs).
+        let cli = session.logs_via_cli(&[]);
+        let cli_messages: Vec<&str> = cli.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(cli_messages, vec!["hello", "boom"]);
+
+        let cli_errors = session.logs_via_cli(&["--level", "error"]);
+        assert_eq!(cli_errors.entries.len(), 1);
+        assert_eq!(cli_errors.entries[0].message, "boom");
     });
 }
 

@@ -225,6 +225,28 @@ impl TestServeSession {
         response.json().expect("Server returned malformed JSON")
     }
 
+    /// Runs `rojo logs --json [extra_args]` against this server (the CLI discovers
+    /// it via the project's serve-state file) and parses the result. Exercises the
+    /// full `rojo logs` path, not just the raw endpoint.
+    pub fn logs_via_cli(&self, extra_args: &[&str]) -> LogsResponse {
+        let mut args = vec!["logs", "--json"];
+        args.extend_from_slice(extra_args);
+
+        let output = Command::new(ROJO_PATH)
+            .args(&args)
+            .current_dir(&self.project_path)
+            .output()
+            .expect("Failed to run `rojo logs`");
+
+        assert!(
+            output.status.success(),
+            "`rojo logs` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        serde_json::from_slice(&output.stdout).expect("`rojo logs --json` returned malformed JSON")
+    }
+
     /// The OS process id of the running `rojo serve`, i.e. the pid the server
     /// reports as `std::process::id()`.
     pub fn pid(&self) -> u32 {

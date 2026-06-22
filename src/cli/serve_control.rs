@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::{
     session_id::SessionId,
     state_file::{self, ServeState},
-    web_api::HealthResponse,
+    web_api::{HealthResponse, LogsResponse},
 };
 
 /// Default timeout for a liveness probe. Short, because a live local server
@@ -76,6 +76,60 @@ pub fn probe(address: IpAddr, port: u16) -> Option<HealthResponse> {
 
         if let Ok(health) = response.json::<HealthResponse>() {
             return Some(health);
+        }
+    }
+
+    None
+}
+
+/// Fetches captured Studio Output from the server at `address:port` via
+/// `/api/logs`, applying the optional `since`/`level`/`limit` filters. Returns
+/// the parsed response, or `None` if no server responds. Used by `rojo logs` and
+/// (indirectly) the `read_logs` MCP tool.
+pub fn fetch_logs(
+    address: IpAddr,
+    port: u16,
+    since: Option<u64>,
+    level: Option<&str>,
+    limit: Option<usize>,
+) -> Option<LogsResponse> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .ok()?;
+
+    let mut params = Vec::new();
+    if let Some(since) = since {
+        params.push(format!("since={since}"));
+    }
+    if let Some(level) = level {
+        params.push(format!("level={level}"));
+    }
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    let query = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+
+    for addr in candidate_addresses(address) {
+        let url = url_for(addr, port, &format!("/api/logs{query}"));
+        let Ok(response) = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+        else {
+            continue;
+        };
+
+        if !response.status().is_success() {
+            continue;
+        }
+
+        if let Ok(logs) = response.json::<LogsResponse>() {
+            return Some(logs);
         }
     }
 

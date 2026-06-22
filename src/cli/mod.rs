@@ -5,6 +5,7 @@ mod doc;
 mod fmt_project;
 mod gen;
 mod init;
+mod logs;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod output;
@@ -31,6 +32,7 @@ pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::gen::GenCommand;
 pub use self::init::{InitCommand, InitKind};
+pub use self::logs::LogsCommand;
 #[cfg(feature = "mcp")]
 pub use self::mcp::McpCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
@@ -69,6 +71,7 @@ impl Options {
             Subcommand::Plugin(subcommand) => subcommand.run(),
             Subcommand::Syncback(subcommand) => subcommand.run(self.global),
             Subcommand::Status(subcommand) => subcommand.run(self.global),
+            Subcommand::Logs(subcommand) => subcommand.run(self.global),
             Subcommand::Stop(subcommand) => subcommand.run(self.global),
             Subcommand::Studio(subcommand) => subcommand.run(self.global),
             Subcommand::Restart(subcommand) => subcommand.run(self.global),
@@ -176,6 +179,7 @@ pub enum Subcommand {
     Plugin(PluginCommand),
     Syncback(SyncbackCommand),
     Status(StatusCommand),
+    Logs(LogsCommand),
     Stop(StopCommand),
     Studio(StudioCommand),
     Restart(RestartCommand),

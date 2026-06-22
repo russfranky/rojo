@@ -14,6 +14,7 @@ local Timer = require(script.Parent.Timer)
 local ChangeBatcher = require(script.Parent.ChangeBatcher)
 local encodePatchUpdate = require(script.Parent.ChangeBatcher.encodePatchUpdate)
 local InstanceMap = require(script.Parent.InstanceMap)
+local LogCapture = require(script.Parent.LogCapture)
 local PatchSet = require(script.Parent.PatchSet)
 local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
@@ -134,6 +135,7 @@ function ServeSession.new(options)
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
 		__changeBatcher = changeBatcher,
+		__logCapture = LogCapture.new(options.apiContext),
 		__statusChangedCallback = nil,
 		__connections = connections,
 		__precommitCallbacks = {},
@@ -276,6 +278,10 @@ function ServeSession:__attemptConnection()
 				self.__reconnectAttempt = 0
 				self:__setStatus(Status.Connected, serverInfo.projectName)
 				self:__applyGameAndPlaceId(serverInfo)
+
+				-- Begin streaming this context's Output to the server once
+				-- connected. Idempotent across reconnects.
+				self.__logCapture:start()
 
 				return self.__apiContext:connectWebSocket({
 					["messages"] = function(messagesPacket)
@@ -723,6 +729,7 @@ function ServeSession:__stopInternal(err)
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()
 	self.__changeBatcher:stop()
+	self.__logCapture:stop()
 
 	for _, connection in ipairs(self.__connections) do
 		connection:Disconnect()

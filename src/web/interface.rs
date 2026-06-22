@@ -25,7 +25,10 @@ use crate::{
 pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Current protocol version, which is required to match.
-pub const PROTOCOL_VERSION: u64 = 5;
+///
+/// Bumped to 6 when the plugin began POSTing captured Output to `/api/feedback`;
+/// the plugin's `Config.protocolVersion` must match.
+pub const PROTOCOL_VERSION: u64 = 6;
 
 /// Message returned by Rojo API when a change has occurred.
 #[derive(Debug, Serialize, Deserialize)]

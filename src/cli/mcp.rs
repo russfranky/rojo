@@ -338,6 +338,43 @@ struct ChildView {
     class_name: String,
 }
 
+/// Connectivity summary returned by the `connection` tool: the connectivity
+/// subset of `rojo status`, with an explicit `connected` boolean so the model
+/// doesn't have to reason about `connectedClients > 0` itself.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionView {
+    /// Whether a Rojo server is running for the project.
+    running: bool,
+    /// Whether at least one Studio plugin is attached (connectedClients > 0).
+    connected: bool,
+    connected_clients: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime_seconds: Option<u64>,
+}
+
+/// Distills `rojo status --json` output into a [`ConnectionView`]. Pure, so it's
+/// unit-tested without a running server.
+fn summarize_connection(status_json: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(status_json).map_err(|err| err.to_string())?;
+
+    let running = value["running"].as_bool().unwrap_or(false);
+    let connected_clients = value["connectedClients"].as_u64().unwrap_or(0);
+
+    let view = ConnectionView {
+        running,
+        connected: connected_clients > 0,
+        connected_clients,
+        session_id: value["sessionId"].as_str().map(str::to_owned),
+        uptime_seconds: value["uptimeSeconds"].as_u64(),
+    };
+
+    serde_json::to_string(&view).map_err(|err| err.to_string())
+}
+
 #[tool_router]
 impl RojoMcpServer {
     #[tool(
@@ -402,6 +439,17 @@ impl RojoMcpServer {
     }
 
     #[tool(
+        description = "Check whether a Roblox Studio plugin is currently connected to the running \
+                       Rojo server (connected = connectedClients > 0). Returns running, connected, \
+                       connectedClients, sessionId, and uptimeSeconds. Use this before expecting \
+                       live sync or read_logs to reflect what's happening in Studio."
+    )]
+    fn connection(&self) -> Result<String, String> {
+        let status = self.run_rojo(&["status", "--json"])?;
+        summarize_connection(&status)
+    }
+
+    #[tool(
         description = "Build the project into a Roblox place or model file. Provide an output \
                        path, relative to the project, ending in .rbxl, .rbxlx, .rbxm, or .rbxmx."
     )]
@@ -458,7 +506,8 @@ impl RojoMcpServer {
                        Studio, deletes its auto-recovery files so no 'restore' prompt appears, \
                        and relaunches it. Optionally open a place file (relative to the project). \
                        Use this to reboot Studio unattended; the Rojo plugin reconnects to the \
-                       running server on its own."
+                       running server on its own, and the result reports whether it reconnected \
+                       (pluginReconnected)."
     )]
     fn reset_studio(
         &self,
@@ -483,10 +532,10 @@ impl ServerHandler for RojoMcpServer {
         info.server_info = Implementation::new("rojo", env!("CARGO_PKG_VERSION"));
 
         let tools = if self.read_only {
-            "sourcemap (instance tree), read_instance, status, read_logs"
+            "sourcemap (instance tree), read_instance, status, connection, read_logs"
         } else {
-            "sourcemap (instance tree), read_instance, status, read_logs, build, gen_script, stop, \
-             restart, reset_studio"
+            "sourcemap (instance tree), read_instance, status, connection, read_logs, build, \
+             gen_script, stop, restart, reset_studio"
         };
         let mode = if self.read_only { " (read-only)" } else { "" };
         info.instructions = Some(format!(
@@ -602,6 +651,31 @@ mod tests {
         let server = attributes_server();
 
         assert!(server.read_instance_json("Workspace/DoesNotExist").is_err());
+    }
+
+    #[test]
+    fn summarize_connection_reports_connected() {
+        let json = r#"{"running":true,"connectedClients":2,"sessionId":"abc","uptimeSeconds":12}"#;
+        let summary: serde_json::Value =
+            serde_json::from_str(&summarize_connection(json).unwrap()).unwrap();
+
+        assert_eq!(summary["running"], true);
+        assert_eq!(summary["connected"], true);
+        assert_eq!(summary["connectedClients"], 2);
+        assert_eq!(summary["sessionId"], "abc");
+        assert_eq!(summary["uptimeSeconds"], 12);
+    }
+
+    #[test]
+    fn summarize_connection_handles_not_running() {
+        let summary: serde_json::Value =
+            serde_json::from_str(&summarize_connection(r#"{"running":false}"#).unwrap()).unwrap();
+
+        assert_eq!(summary["running"], false);
+        assert_eq!(summary["connected"], false);
+        assert_eq!(summary["connectedClients"], 0);
+        // Absent optional fields are omitted, not null.
+        assert!(summary.get("sessionId").is_none());
     }
 
     #[test]

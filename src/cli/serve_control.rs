@@ -233,3 +233,26 @@ pub fn wait_until_online(address: IpAddr, port: u16, timeout: Duration) -> bool 
 
     false
 }
+
+/// Polls until the server reports at least `target` connected clients, up to
+/// `timeout`. Used by `rojo studio reset` to confirm the Studio plugin has
+/// reconnected after Studio relaunches. Returns whether the count was reached.
+pub fn wait_until_clients_at_least(
+    address: IpAddr,
+    port: u16,
+    target: u64,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        if let Some(health) = probe(address, port) {
+            if health.connected_clients >= target {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    false
+}

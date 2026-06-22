@@ -23,6 +23,7 @@
 //!    reboot.
 
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -33,7 +34,7 @@ use anyhow::Context;
 use clap::Parser;
 use serde::Serialize;
 
-use super::{output, resolve_path, GlobalOptions};
+use super::{output, resolve_path, resolve_project_root, serve_control, GlobalOptions};
 
 /// The macOS process name matched when force-killing Studio. `pkill -f` matches
 /// it as a substring of the full command line, so this also catches
@@ -129,6 +130,14 @@ pub struct StudioResetCommand {
     /// By default serve is left running and the plugin simply reconnects.
     #[clap(long)]
     pub restart_serve: bool,
+
+    /// Don't wait to confirm the Rojo plugin reconnected after Studio relaunches.
+    #[clap(long)]
+    pub no_wait_reconnect: bool,
+
+    /// How long, in seconds, to wait for the plugin to reconnect after relaunch.
+    #[clap(long, default_value = "45")]
+    pub reconnect_timeout: u64,
 }
 
 /// Resolved inputs for [`plan_reset`], decoupled from clap and the current
@@ -143,6 +152,24 @@ struct ResetInputs {
     /// Whether to suppress the macOS crash dialog around the kill.
     silence_crashes: bool,
     restart_serve: bool,
+}
+
+/// Where and how long to poll for the plugin to reconnect after relaunch.
+/// Computed before the kill (so the baseline client count is known) and consumed
+/// by [`execute_plan`] after Studio is relaunched.
+struct ReconnectTarget {
+    address: IpAddr,
+    port: u16,
+    /// Connected-client count to wait for (the pre-kill count, at least 1).
+    target: u64,
+    timeout: Duration,
+}
+
+/// The connected-client count to treat as "reconnected": the pre-kill count, but
+/// always at least one (we launched Studio, so expect a client even if none was
+/// connected before).
+fn reconnect_target(before_clients: u64) -> u64 {
+    before_clients.max(1)
 }
 
 /// The concrete steps a reset will run, computed up front so the decision logic
@@ -178,6 +205,14 @@ struct ResetResult {
     serve_restarted: bool,
     /// Whether Studio was relaunched.
     relaunched: bool,
+    /// Whether the Studio plugin reconnected after relaunch. `None` when not
+    /// checked (no server running, `--no-launch`, `--no-wait-reconnect`, or
+    /// `--restart-serve`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_reconnected: Option<bool>,
+    /// Connected-client count observed after relaunch, when reconnect was checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connected_clients_after: Option<u64>,
 }
 
 /// Studio's default macOS auto-recovery directory. There is no Studio setting to
@@ -289,7 +324,23 @@ impl StudioResetCommand {
         let home = home_dir()?;
         let plan = plan_reset(&inputs, &home);
 
-        let result = execute_plan(&plan, &self.project)?;
+        // Discover the running server before the kill so we know where to poll and
+        // the baseline client count to wait for. Skipped when we won't relaunch,
+        // when asked not to wait, or when restarting serve (which bounces the
+        // server and makes the baseline meaningless).
+        let reconnect = if self.no_launch || self.no_wait_reconnect || self.restart_serve {
+            None
+        } else {
+            let root_dir = resolve_project_root(&self.project)?;
+            serve_control::discover_running(&root_dir).map(|(state, health)| ReconnectTarget {
+                address: state.address,
+                port: state.port,
+                target: reconnect_target(health.connected_clients),
+                timeout: Duration::from_secs(self.reconnect_timeout),
+            })
+        };
+
+        let result = execute_plan(&plan, &self.project, reconnect)?;
 
         output::emit(&global, &result, || {
             let mut parts = vec![if result.killed {
@@ -314,6 +365,11 @@ impl StudioResetCommand {
             } else {
                 "did not relaunch".to_owned()
             });
+            match result.plugin_reconnected {
+                Some(true) => parts.push("plugin reconnected".to_owned()),
+                Some(false) => parts.push("plugin did NOT reconnect in time".to_owned()),
+                None => {}
+            }
             println!("Studio reset: {}.", parts.join("; "));
             Ok(())
         })
@@ -324,7 +380,11 @@ impl StudioResetCommand {
 /// → (restart serve) → relaunch → restore crash dialog. Killing and clearing are
 /// best-effort (a missing Studio or recovery directory is fine); a failed
 /// *relaunch* is fatal, since getting Studio back up is the point of the command.
-fn execute_plan(plan: &ResetPlan, project: &Path) -> anyhow::Result<ResetResult> {
+fn execute_plan(
+    plan: &ResetPlan,
+    project: &Path,
+    reconnect: Option<ReconnectTarget>,
+) -> anyhow::Result<ResetResult> {
     // Silence macOS's crash reporter around the force-kill so Studio's abnormal
     // exit doesn't raise the system "quit unexpectedly" dialog. The guard
     // restores the prior setting when it drops — including on an early return
@@ -362,8 +422,26 @@ fn execute_plan(plan: &ResetPlan, project: &Path) -> anyhow::Result<ResetResult>
         None => false,
     };
 
-    // Restore the crash-reporter setting now the kill-dialog window has passed.
+    // Restore the crash-reporter setting now the kill-dialog window has passed
+    // (before the potentially long reconnect wait below).
     drop(crash_guard);
+
+    // If we relaunched and have a server to check, wait for the plugin to
+    // reconnect so the result reflects whether Studio actually came back online.
+    let (plugin_reconnected, connected_clients_after) = match reconnect {
+        Some(target) if relaunched => {
+            let reached = serve_control::wait_until_clients_at_least(
+                target.address,
+                target.port,
+                target.target,
+                target.timeout,
+            );
+            let after = serve_control::probe(target.address, target.port)
+                .map(|health| health.connected_clients);
+            (Some(reached), after)
+        }
+        _ => (None, None),
+    };
 
     Ok(ResetResult {
         killed,
@@ -371,6 +449,8 @@ fn execute_plan(plan: &ResetPlan, project: &Path) -> anyhow::Result<ResetResult>
         recovery_cleared_count,
         serve_restarted,
         relaunched,
+        plugin_reconnected,
+        connected_clients_after,
     })
 }
 
@@ -727,5 +807,14 @@ mod tests {
         match cmd.subcommand {
             StudioSubcommand::Reset(reset) => assert!(reset.no_silence_crashes),
         }
+    }
+
+    #[test]
+    fn reconnect_target_is_at_least_one() {
+        // We launched Studio, so always expect at least one client back, even if
+        // none was connected before; otherwise wait for the prior count.
+        assert_eq!(reconnect_target(0), 1);
+        assert_eq!(reconnect_target(1), 1);
+        assert_eq!(reconnect_target(3), 3);
     }
 }

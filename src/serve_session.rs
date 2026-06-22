@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 
 use crate::{
     change_processor::ChangeProcessor,
+    log_buffer::LogBuffer,
     message_queue::MessageQueue,
     project::{Project, ProjectError},
     session_id::SessionId,
@@ -86,6 +87,12 @@ pub struct ServeSession {
     /// to be applied.
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
 
+    /// A bounded ring buffer of log entries (Output) captured from the connected
+    /// Studio session via `/api/feedback`. Read back out via `/api/logs` (the
+    /// `rojo logs` CLI and the `read_logs` MCP tool). The server half of the
+    /// runtime-feedback loop.
+    log_buffer: Arc<LogBuffer>,
+
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
     tree_mutation_sender: Sender<PatchSet>,
@@ -151,6 +158,7 @@ impl ServeSession {
 
         let tree = Arc::new(Mutex::new(tree));
         let message_queue = Arc::new(message_queue);
+        let log_buffer = Arc::new(LogBuffer::new());
         let vfs = Arc::new(vfs);
 
         let (tree_mutation_sender, tree_mutation_receiver) = crossbeam_channel::unbounded();
@@ -170,6 +178,7 @@ impl ServeSession {
             root_project,
             tree,
             message_queue,
+            log_buffer,
             tree_mutation_sender,
             vfs,
             connected_clients: Arc::new(AtomicUsize::new(0)),
@@ -196,6 +205,11 @@ impl ServeSession {
 
     pub fn message_queue(&self) -> &MessageQueue<AppliedPatchSet> {
         &self.message_queue
+    }
+
+    /// The buffer of log entries captured from the connected Studio session.
+    pub fn log_buffer(&self) -> &LogBuffer {
+        &self.log_buffer
     }
 
     pub fn session_id(&self) -> SessionId {

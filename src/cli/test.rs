@@ -13,15 +13,24 @@ use super::{output, resolve_path, resolve_project_root, GlobalOptions};
 
 /// Runs a project's Luau tests with a pluggable test runner.
 ///
-/// Rojo doesn't ship a Luau runtime, so this orchestrates an external runner:
+/// Rojo doesn't ship a Luau runtime, so this orchestrates an external one. Pick
+/// the runner that matches where your tests need to run:
 ///
-/// * `run-in-roblox` (default): builds the project into a place and runs a
-///   bootstrap script inside real Roblox Studio. Highest fidelity; needs Studio
-///   and the `run-in-roblox` binary.
 /// * `lune`: runs a Luau script with the standalone `lune` runtime. Fast and
-///   CI-friendly, but only a subset of Roblox APIs are available.
+///   CI-friendly and the best choice for headless logic tests — but it exposes
+///   only a subset of Roblox APIs and can't boot a real `DataModel`, so it can't
+///   test anything that needs the engine running.
 /// * `custom`: runs an arbitrary command (given after `--`). The built place
-///   path is provided to it via the `ROJO_TEST_PLACE` environment variable.
+///   path is provided to it via the `ROJO_TEST_PLACE` environment variable. Use
+///   this to plug in your own boot harness.
+/// * `run-in-roblox` (default, legacy): builds the project into a place and runs
+///   a bootstrap script inside real Roblox Studio via the `run-in-roblox`
+///   binary. NOTE: `run-in-roblox`'s only release is v0.3.0 (July 2020), so
+///   driving a current Studio with it is a real compatibility gamble. For
+///   tests that need a live Studio, prefer running your test entrypoint through
+///   the official Roblox Studio MCP server (`run_code`/`execute_luau`) against
+///   an open Studio — keep one running with `rojo studio reset`. See
+///   `docs/agent-workflow.md`.
 #[derive(Debug, Parser)]
 pub struct TestCommand {
     /// Path to the project to test. Defaults to the current directory.

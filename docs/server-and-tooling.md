@@ -7,6 +7,7 @@ Model Context Protocol (MCP) server.
 - [Connection resilience](#connection-resilience)
 - [Server lifecycle commands](#server-lifecycle-commands)
 - [`rojo test`](#rojo-test)
+- [`rojo logs`](#rojo-logs)
 - [`rojo gen`](#rojo-gen)
 - [Machine-readable output (`--json`)](#machine-readable-output---json)
 - [Project hooks](#project-hooks)
@@ -207,15 +208,24 @@ Runs a project's Luau tests with a pluggable runner. Rojo does not ship a Luau
 runtime, so this orchestrates an external one.
 
 ```
-rojo test [PROJECT] [--runner <run-in-roblox|lune|custom>] [--script <PATH>]
+rojo test [PROJECT] [--runner <lune|custom|run-in-roblox>] [--script <PATH>]
           [--place <PATH>] [--json] [-- <ARGS>...]
 ```
 
 | Runner | Needs | Notes |
 | --- | --- | --- |
-| `run-in-roblox` (default) | `run-in-roblox` binary + Studio | Highest fidelity: builds a place and runs your bootstrap script inside real Studio. |
-| `lune` | `lune` binary | Fast and CI-friendly, but only a subset of Roblox APIs is available. |
-| `custom` | your command (after `--`) | Runs an arbitrary command; the built place path is exposed via `ROJO_TEST_PLACE`. |
+| `lune` | `lune` binary | Fast, headless, CI-friendly — best for pure-logic tests. Exposes only a subset of Roblox APIs and **can't boot a real `DataModel`**, so it can't test engine-dependent code. |
+| `custom` | your command (after `--`) | Runs an arbitrary command; the built place path is exposed via `ROJO_TEST_PLACE`. Use it to plug in your own boot harness. |
+| `run-in-roblox` (default, legacy) | `run-in-roblox` binary + Studio | Builds a place and runs your bootstrap script inside real Studio. ⚠️ **`run-in-roblox`'s only release is v0.3.0 (July 2020)** — driving a current Studio with a 5½-year-old tool is a real compatibility gamble. See the recommendation below. |
+
+> **Testing in a live Studio? Don't reach for `run-in-roblox`.** The maintained
+> way to run Luau in an open Studio is the official [Roblox Studio MCP
+> server](https://create.roblox.com/docs/studio/mcp)'s `run_code` /
+> `execute_luau`: point it at a Studio you keep open with
+> [`rojo studio reset`](#rebooting-studio-unattended-rojo-studio-reset) and run
+> your test entrypoint (e.g. `IntegrationTests.runAll()`) there, reading results
+> back from the call and from [`rojo logs`](#rojo-logs). See the
+> [agent workflow guide](./agent-workflow.md) for the full loop.
 
 - `--script` is the test entry/bootstrap script (required for `run-in-roblox`
   and `lune`); it is resolved to an absolute path.
@@ -233,6 +243,38 @@ Examples:
 ```bash
 rojo test --runner lune --script tests/init.luau
 rojo test --runner custom -- ./run-my-tests.sh   # $ROJO_TEST_PLACE is set
+```
+
+---
+
+## `rojo logs`
+
+Prints the recent Output — `print`s, warnings, and errors — captured from the
+connected Roblox Studio session. This is the read side of Rojo's runtime-feedback
+loop: it lets an agent *see what happened when the game ran* (script errors, test
+output, debug prints) without a human watching the Output window.
+
+The Studio plugin streams its `LogService` output to the running `rojo serve`
+(via `POST /api/feedback`), which keeps it in a bounded in-memory buffer; this
+command (and the `read_logs` MCP tool) read it back.
+
+```
+rojo logs [PROJECT] [--since <SEQ>] [--level <print|info|warning|error>]
+          [--limit <N>] [--json]
+```
+
+- Requires a running server for the project (`rojo serve`) with the plugin
+  connected and output capture enabled (on by default — the plugin's
+  `captureOutput` setting).
+- Output is captured in both edit and play (playtest) modes.
+- `--level` filters by minimum severity; `--limit` keeps the newest N entries.
+- `--since <SEQ>` returns only entries newer than a sequence number. Each call
+  reports a `tailSeq`; pass it back as `--since` next time to poll for only the
+  new lines without re-seeing old ones.
+
+```bash
+rojo logs --level warning          # only warnings and errors
+rojo logs --since 1240 --json      # new lines since seq 1240, machine-readable
 ```
 
 ---
@@ -368,6 +410,8 @@ rojo mcp [PROJECT] [--read-only]
 | `sourcemap` | no | The project's instance tree (best for navigation). |
 | `read_instance` | no | One instance's class, property values, and immediate children, located by a slash-separated path from the root (e.g. `ReplicatedStorage/Shared/MyModule`). |
 | `status` | no | Whether a server is running, and its details. |
+| `connection` | no | Connectivity summary — `connected`, `connectedClients`, `sessionId`, `uptimeSeconds`, `running`. Check before expecting live sync or `read_logs` to reflect Studio. |
+| `read_logs` | no | Recent Studio Output (prints/warnings/errors) captured at runtime, e.g. after a playtest. Filter by `level`/`limit`; poll with `since`. |
 | `build` | yes | Build the project to a `.rbxl`/`.rbxlx`/`.rbxm`/`.rbxmx` file. |
 | `gen_script` | yes | Scaffold a server/client/module script. |
 | `stop` | yes | Stop the running server. |
@@ -377,8 +421,8 @@ rojo mcp [PROJECT] [--read-only]
 ### Read-only mode
 
 `--read-only` exposes only the non-mutating tools (`sourcemap`, `read_instance`,
-`status`); the mutating tools are hidden and rejected. This is the safe default
-for untrusted sessions.
+`status`, `connection`, `read_logs`); the mutating tools are hidden and rejected.
+This is the safe default for untrusted sessions.
 
 ### Safety
 

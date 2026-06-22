@@ -38,6 +38,9 @@ Making a new release? Simply add the new header with the version and date undern
 * Added a global `--json` flag for machine-readable output on `build`, `sourcemap`, `status`, `stop`, `restart`, `test`, and `gen`.
 * Added an optional `rojo mcp` Model Context Protocol server (build with `--features mcp`) that exposes Rojo's tooling to AI assistants over stdio, including a `--read-only` inspector mode.
 * Added `rojo studio reset` (macOS) and a matching `reset_studio` MCP tool to force-restart Roblox Studio without the "Don't Save", macOS "quit unexpectedly", or auto-recovery dialogs, so Studio can be rebooted unattended during a serve/test loop.
+* Added a runtime-feedback loop: the Studio plugin now captures its Output (prints, warnings, and errors, in both edit and play modes) and streams it to `rojo serve` (`POST /api/feedback`), which buffers it for `GET /api/logs`. Read it back with the new `rojo logs` command or the `read_logs` MCP tool, so an agent can see what happened when the game ran.
+* Added a `connection` MCP tool (the connectivity subset of `rojo status`, with an explicit `connected` flag), and `rojo studio reset` now verifies the plugin reconnects after relaunch (`--no-wait-reconnect`/`--reconnect-timeout` to control it).
+* Documented an [agent workflow guide](docs/agent-workflow.md) for autonomous edit→run→observe loops (Rojo for sync/reset/logs, the official Roblox Studio MCP for running code), and clarified that the `rojo test` `run-in-roblox` runner is legacy (its only release is v0.3.0, July 2020).
 * `inf` and `nan` values in properties are now synced ([#1176])
 * Fixed a bug caused by having reference properties (such as `ObjectValue.Value`) that point to an Instance not included in syncback. ([#1179])
 * Fixed instance replacement fallback failing when too many instances needed to be replaced. ([#1192])
